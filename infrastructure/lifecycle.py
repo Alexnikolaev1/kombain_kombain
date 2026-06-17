@@ -15,6 +15,7 @@ from aiogram import Bot, Dispatcher
 from db.database import close_db
 from infrastructure.health import heartbeat_loop, stop_health_server, touch_heartbeat
 from services.llm_client import close_http_client
+from services.gemini_client import close_gemini_client
 
 logger = logging.getLogger("ai_kombain.lifecycle")
 
@@ -93,6 +94,7 @@ async def run_bot(
             await polling_task
 
         await close_http_client()
+        await close_gemini_client()
         await close_db()
         await bot.session.close()
         logger.info("🛑 Бот остановлен")

@@ -27,34 +27,30 @@ from db.database import (
     save_to_cache,
 )
 from db.models import ContentSource, PromptType
+from domain.models_catalog import resolve_model_id
 from prompts.templates import get_prompt
 
 logger = logging.getLogger("ai_kombain.llm")
 
 
-class LLMError(Exception):
-    """Базовое исключение для ошибок LLM-клиента."""
-
-
-class LLMRateLimitError(LLMError):
-    """Rate limit от API (429)."""
-
-
-class LLMContextTooLargeError(LLMError):
-    """Текст превышает контекстное окно модели."""
-
-
-class DailyLimitExceededError(LLMError):
-    """Превышен дневной лимит запросов пользователя."""
-
+from services.llm_errors import (
+    DailyLimitExceededError,
+    LLMContextTooLargeError,
+    LLMError,
+    LLMModelNotFoundError,
+    LLMRateLimitError,
+)
 
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 def get_http_client() -> httpx.AsyncClient:
     global _http_client
+    settings = get_settings()
+    if not settings.OPENROUTER_API_KEY:
+        raise LLMError("OPENROUTER_API_KEY не задан")
+
     if _http_client is None or _http_client.is_closed:
-        settings = get_settings()
         _http_client = httpx.AsyncClient(
             base_url=settings.OPENROUTER_BASE_URL,
             headers={
@@ -75,7 +71,7 @@ async def close_http_client() -> None:
         _http_client = None
 
 
-async def _call_llm_api(
+async def _call_openrouter_api(
     system_prompt: str,
     user_message: str,
     model: str,
@@ -107,7 +103,10 @@ async def _call_llm_api(
             raise LLMError(f"Неверный запрос: {detail}")
 
         if response.status_code != 200:
-            raise LLMError(f"API вернул {response.status_code}: {response.text[:200]}")
+            detail = response.text[:200]
+            if response.status_code == 404:
+                raise LLMModelNotFoundError(f"Модель недоступна: {model}. {detail}")
+            raise LLMError(f"API вернул {response.status_code}: {detail}")
 
         data = response.json()
         choices = data.get("choices", [])
@@ -127,7 +126,7 @@ async def _call_llm_api(
         )
         return response_text, tokens_used
 
-    except (LLMRateLimitError, LLMContextTooLargeError, LLMError):
+    except (LLMRateLimitError, LLMContextTooLargeError, LLMModelNotFoundError, LLMError):
         raise
     except httpx.TimeoutException:
         raise LLMError("Таймаут запроса к LLM. Попробуйте снова.")
@@ -144,20 +143,33 @@ async def _call_with_retry(
     max_tokens: int,
     temperature: float,
     max_retries: int = 3,
-) -> tuple[str, int]:
+) -> tuple[str, int, str]:
+    """Возвращает (ответ, токены, фактическая_модель)."""
     settings = get_settings()
+    models_to_try: list[str] = []
+    if settings.OPENROUTER_API_KEY:
+        for candidate in (model, settings.FALLBACK_MODEL):
+            resolved = resolve_model_id(candidate)
+            if resolved not in models_to_try:
+                models_to_try.append(resolved)
+
     last_error: Exception | None = None
 
-    for model_attempt in (model, settings.FALLBACK_MODEL):
+    for model_attempt in models_to_try:
         for attempt in range(max_retries):
             try:
-                return await _call_llm_api(
+                response_text, tokens_used = await _call_openrouter_api(
                     system_prompt,
                     user_message,
                     model_attempt,
                     max_tokens,
                     temperature,
                 )
+                return response_text, tokens_used, model_attempt
+            except LLMModelNotFoundError as e:
+                last_error = e
+                logger.warning("Модель %s недоступна, пробуем следующую", model_attempt)
+                break
             except LLMRateLimitError as e:
                 last_error = e
                 wait_sec = 2 ** attempt * 5
@@ -171,9 +183,8 @@ async def _call_with_retry(
             except LLMContextTooLargeError as e:
                 last_error = e
                 logger.warning(
-                    "Контекст слишком большой для %s, пробуем %s",
+                    "Контекст слишком большой для %s, пробуем fallback",
                     model_attempt,
-                    settings.FALLBACK_MODEL,
                 )
                 break
             except LLMError as e:
@@ -188,7 +199,28 @@ async def _call_with_retry(
                     )
                     await asyncio.sleep(wait_sec)
 
-    raise LLMError(f"Все попытки исчерпаны. Последняя ошибка: {last_error}")
+    if settings.GEMINI_API_KEY:
+        from services.gemini_client import call_gemini_api, gemini_model_label
+
+        try:
+            logger.info("OpenRouter недоступен, пробуем Gemini API")
+            response_text, tokens_used = await call_gemini_api(
+                system_prompt,
+                user_message,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            used_model = gemini_model_label()
+            return response_text, tokens_used, used_model
+        except LLMError as e:
+            last_error = e
+            logger.warning("Gemini fallback не сработал: %s", e)
+
+    raise LLMError(
+        "Не удалось получить ответ от ИИ. Проверьте модель в настройках "
+        "или добавьте GEMINI_API_KEY / кредиты OpenRouter. "
+        f"Последняя ошибка: {last_error}"
+    )
 
 
 async def process_content(
@@ -204,7 +236,7 @@ async def process_content(
     start_time = time.monotonic()
 
     async with get_session() as session:
-        chosen_model = settings.DEFAULT_MODEL
+        chosen_model = resolve_model_id(settings.DEFAULT_MODEL)
         if user_id is not None:
             chosen_model = await get_user_model(session, user_id)
             allowed, remaining = await check_daily_limit(session, user_id)
@@ -258,7 +290,7 @@ async def process_content(
     )
 
     try:
-        response_text, tokens_used = await _call_with_retry(
+        response_text, tokens_used, used_model = await _call_with_retry(
             system_prompt=system_prompt,
             user_message=user_message,
             model=chosen_model,
@@ -290,7 +322,7 @@ async def process_content(
             prompt_type=prompt_type,
             context=context,
             response_text=response_text,
-            model_used=chosen_model,
+            model_used=used_model,
             tokens_used=tokens_used,
             source_url=source_url or None,
             user_id=user_id,
@@ -305,7 +337,7 @@ async def process_content(
                 was_cached=False,
                 tokens_used=tokens_used,
                 processing_ms=(time.monotonic() - start_time) * 1000,
-                model_used=chosen_model,
+                model_used=used_model,
                 success=True,
             )
 
@@ -315,7 +347,7 @@ async def process_content(
         "was_cached": False,
         "tokens_used": tokens_used,
         "tokens_saved": 0,
-        "model": chosen_model,
+        "model": used_model,
         "processing_ms": elapsed_ms,
         "cache_hits": 0,
     }

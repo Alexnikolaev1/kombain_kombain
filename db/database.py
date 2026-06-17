@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from config import get_settings
 from db.models import AICache, Base, ContentSource, PromptType, UsageStat, User
+from domain.models_catalog import resolve_model_id
 
 logger = logging.getLogger("ai_kombain.db")
 
@@ -145,7 +146,9 @@ async def get_user_model(session: AsyncSession, user_id: int) -> str:
     preferred = await session.scalar(
         select(User.preferred_model).where(User.id == user_id)
     )
-    return str(preferred) if preferred else settings.DEFAULT_MODEL
+    if preferred:
+        return resolve_model_id(str(preferred))
+    return resolve_model_id(settings.DEFAULT_MODEL)
 
 
 async def check_daily_limit(session: AsyncSession, user_id: int) -> tuple[bool, int]:

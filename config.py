@@ -60,14 +60,21 @@ class Settings:
     OPENROUTER_API_KEY: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
-    # Модель по умолчанию (дешевая + мощная). Можно переключить на:
-    # "google/gemini-flash-1.5", "meta-llama/llama-3.1-70b-instruct:free", "groq/llama3-70b-8192"
+    # Google Gemini API (бесплатный ключ AI Studio) — запасной провайдер
+    GEMINI_API_KEY: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    GEMINI_MODEL: str = field(
+        default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    )
+
+    # Модель по умолчанию
     DEFAULT_MODEL: str = field(
-        default_factory=lambda: os.getenv("DEFAULT_MODEL", "google/gemini-flash-1.5")
+        default_factory=lambda: os.getenv("DEFAULT_MODEL", "google/gemini-2.5-flash")
     )
 
     # Запасная модель если основная недоступна
-    FALLBACK_MODEL: str = "meta-llama/llama-3.1-8b-instruct:free"
+    FALLBACK_MODEL: str = field(
+        default_factory=lambda: os.getenv("FALLBACK_MODEL", "openrouter/free")
+    )
 
     # База данных
     DATABASE_URL: str = field(
@@ -111,13 +118,22 @@ class Settings:
         errors = []
         if not self.TELEGRAM_TOKEN:
             errors.append("TELEGRAM_TOKEN не задан")
-        if not self.OPENROUTER_API_KEY:
-            errors.append("OPENROUTER_API_KEY не задан")
+        if not self.OPENROUTER_API_KEY and not self.GEMINI_API_KEY:
+            errors.append("Нужен OPENROUTER_API_KEY или GEMINI_API_KEY")
         if errors:
             for err in errors:
                 logger.critical(f"❌ Конфигурация: {err}")
             raise ValueError(f"Ошибки конфигурации: {'; '.join(errors)}")
-        logger.info(f"✅ Конфигурация загружена. Модель: {self.DEFAULT_MODEL}")
+        providers = []
+        if self.OPENROUTER_API_KEY:
+            providers.append("OpenRouter")
+        if self.GEMINI_API_KEY:
+            providers.append("Gemini")
+        logger.info(
+            "✅ Конфигурация загружена. Модель: %s. Провайдеры: %s",
+            self.DEFAULT_MODEL,
+            ", ".join(providers),
+        )
 
 
 @lru_cache(maxsize=1)
