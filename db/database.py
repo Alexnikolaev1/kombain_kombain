@@ -43,15 +43,23 @@ def _create_engine():
     return engine
 
 
-engine = _create_engine()
+def _ensure_db() -> None:
+    """Ленивая инициализация движка — не падаем при импорте без env-переменных."""
+    global engine, AsyncSessionFactory
+    if engine is not None:
+        return
 
-# Фабрика сессий — используем по всему приложению
-AsyncSessionFactory = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,    # Не сбрасываем атрибуты после commit (важно для async)
-    autoflush=False,
-)
+    engine = _create_engine()
+    AsyncSessionFactory = async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+
+
+engine = None
+AsyncSessionFactory = None
 
 
 async def init_db() -> None:
@@ -60,6 +68,8 @@ async def init_db() -> None:
     Вызывается один раз при старте бота.
     """
     from pathlib import Path
+
+    _ensure_db()
 
     # Создаём директорию для SQLite файла если нужно
     settings = get_settings()
@@ -74,6 +84,8 @@ async def init_db() -> None:
 
 async def close_db() -> None:
     """Закрывает пул соединений при остановке приложения."""
+    if engine is None:
+        return
     await engine.dispose()
     logger.info("База данных отключена")
 
@@ -87,6 +99,7 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
         async with get_session() as session:
             result = await session.execute(select(User))
     """
+    _ensure_db()
     async with AsyncSessionFactory() as session:
         try:
             yield session

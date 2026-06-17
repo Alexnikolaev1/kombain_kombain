@@ -14,7 +14,15 @@ from infrastructure.lifecycle import run_bot
 
 
 async def main() -> None:
-    app_settings = get_settings()
+    try:
+        app_settings = get_settings()
+    except ValueError as exc:
+        logger.critical(
+            "Не заданы обязательные переменные окружения. "
+            "На Railway: Service → Variables → добавьте TELEGRAM_TOKEN и OPENROUTER_API_KEY"
+        )
+        raise SystemExit(1) from exc
+
     await init_db()
 
     bot = Bot(token=app_settings.TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
