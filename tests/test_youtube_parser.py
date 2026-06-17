@@ -39,14 +39,13 @@ def test_parse_json3_subtitle_payload():
     assert text == "Привет мир"
 
 
-def test_extract_ytdlp_transcript_prefers_requested_language():
-    class FakeYdl:
-        def urlopen(self, url):
-            class Resp:
-                def read(self):
-                    return b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nRussian text\n"
+def test_extract_ytdlp_transcript_prefers_requested_language(monkeypatch):
+    def fake_download(url: str) -> str:
+        if "ru" in url:
+            return "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nRussian text\n"
+        return "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nEnglish text\n"
 
-            return Resp()
+    monkeypatch.setattr("services.parser._download_subtitle_url", fake_download)
 
     info = {
         "subtitles": {
@@ -55,6 +54,14 @@ def test_extract_ytdlp_transcript_prefers_requested_language():
         }
     }
 
-    text, lang = _extract_ytdlp_transcript(info, FakeYdl(), ["ru", "en"])
+    text, lang = _extract_ytdlp_transcript(info, ["ru", "en"])
     assert "Russian text" in text
     assert lang == "ru"
+
+
+def test_language_matches_region_codes():
+    from services.parser import _language_matches
+
+    assert _language_matches("ru-RU", "ru")
+    assert _language_matches("en-US", "en")
+    assert not _language_matches("de", "ru")

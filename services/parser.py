@@ -235,8 +235,37 @@ def _ytdlp_options() -> dict:
     }
 
 
+def _language_matches(track_lang: str, preferred: str) -> bool:
+    track = track_lang.lower().replace("_", "-")
+    pref = preferred.lower()
+    return track == pref or track.startswith(f"{pref}-")
+
+
+def _iter_tracks_in_order(
+    tracks: dict,
+    preferred_languages: list[str],
+) -> list[tuple[str, list[dict]]]:
+    """Возвращает дорожки субтитров в порядке приоритета языков."""
+    ordered: list[tuple[str, list[dict]]] = []
+    seen: set[str] = set()
+
+    for pref in preferred_languages:
+        for lang, formats in tracks.items():
+            if lang in seen or not formats:
+                continue
+            if _language_matches(lang, pref):
+                seen.add(lang)
+                ordered.append((lang, formats))
+
+    for lang, formats in tracks.items():
+        if lang not in seen and formats:
+            ordered.append((lang, formats))
+
+    return ordered
+
+
 def _pick_subtitle_format(formats: list[dict]) -> Optional[dict]:
-    for ext in ("vtt", "srv3", "ttml", "json3"):
+    for ext in ("json3", "vtt", "ttml"):
         for fmt in formats:
             if fmt.get("ext") == ext:
                 return fmt
@@ -266,6 +295,8 @@ def _parse_subtitle_payload(raw: str, ext: str) -> str:
             continue
         if line.startswith("NOTE") or line.startswith("STYLE"):
             continue
+        if line.startswith("Kind:") or line.startswith("Language:"):
+            continue
         line = re.sub(r"<[^>]+>", "", line)
         line = unescape(line).strip()
         if line:
@@ -278,18 +309,35 @@ def _parse_subtitle_payload(raw: str, ext: str) -> str:
     return " ".join(deduped)
 
 
-def _download_ytdlp_subtitle(ydl, formats: list[dict]) -> str:
+def _download_subtitle_url(url: str) -> str:
+    """Скачивает файл субтитров напрямую — не зависит от жизненного цикла yt-dlp."""
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "ru,en;q=0.9",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _download_ytdlp_subtitle(formats: list[dict]) -> str:
     fmt = _pick_subtitle_format(formats)
     if not fmt or not fmt.get("url"):
         return ""
 
-    raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", errors="replace")
+    raw = _download_subtitle_url(fmt["url"])
     return _parse_subtitle_payload(raw, str(fmt.get("ext", "vtt")))
 
 
 def _extract_ytdlp_transcript(
     info: dict,
-    ydl,
     preferred_languages: list[str],
 ) -> tuple[str, str]:
     """Ищет субтитры в метаданных yt-dlp."""
@@ -298,14 +346,8 @@ def _extract_ytdlp_transcript(
         if not tracks:
             continue
 
-        for lang in preferred_languages:
-            if lang in tracks:
-                text = _download_ytdlp_subtitle(ydl, tracks[lang])
-                if text:
-                    return text, f"{lang}{auto_label}"
-
-        for lang, formats in tracks.items():
-            text = _download_ytdlp_subtitle(ydl, formats)
+        for lang, formats in _iter_tracks_in_order(tracks, preferred_languages):
+            text = _download_ytdlp_subtitle(formats)
             if text:
                 return text, f"{lang}{auto_label}"
 
@@ -322,10 +364,10 @@ def _fetch_via_ytdlp(
     url = f"https://www.youtube.com/watch?v={video_id}"
     with yt_dlp.YoutubeDL(_ytdlp_options()) as ydl:
         info = ydl.extract_info(url, download=False)
+        title = str(info.get("title") or "")
+        description = str(info.get("description") or "")[:1000]
+        transcript_text, language = _extract_ytdlp_transcript(info, preferred_languages)
 
-    title = str(info.get("title") or "")
-    description = str(info.get("description") or "")[:1000]
-    transcript_text, language = _extract_ytdlp_transcript(info, ydl, preferred_languages)
     if transcript_text:
         transcript_text = _clean_transcript(transcript_text)[:max_chars]
     return title, description, transcript_text, language
@@ -339,10 +381,25 @@ def _fetch_via_transcript_api(
     from youtube_transcript_api import YouTubeTranscriptApi
 
     api = YouTubeTranscriptApi()
-    fetched = api.fetch(video_id, languages=preferred_languages)
+    try:
+        fetched = api.fetch(video_id, languages=preferred_languages)
+    except Exception:
+        transcript_list = api.list(video_id)
+        try:
+            transcript = transcript_list.find_transcript(preferred_languages)
+        except Exception:
+            available = list(transcript_list)
+            if not available:
+                raise
+            transcript = available[0]
+        fetched = transcript.fetch()
+
     text = " ".join(snippet.text for snippet in fetched)
     language = getattr(fetched, "language_code", "") or "unknown"
-    return _clean_transcript(text)[:max_chars], language
+    cleaned = _clean_transcript(text)[:max_chars]
+    if not cleaned:
+        raise ValueError("Пустой ответ transcript-api")
+    return cleaned, language
 
 
 def _fetch_youtube_data_sync(
