@@ -5,6 +5,7 @@ main.py — Точка входа. Запускает бота.
 import asyncio
 
 from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from config import get_settings, logger
@@ -25,7 +26,10 @@ async def main() -> None:
 
     await init_db()
 
-    bot = Bot(token=app_settings.TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(
+        token=app_settings.TELEGRAM_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = create_dispatcher()
 
     await run_bot(
