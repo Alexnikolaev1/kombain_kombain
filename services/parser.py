@@ -220,6 +220,131 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
         )
 
 
+def _ytdlp_options() -> dict:
+    """Опции yt-dlp: без скачивания видео, с обходом типичных ошибок форматов."""
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            },
+        },
+    }
+
+
+def _pick_subtitle_format(formats: list[dict]) -> Optional[dict]:
+    for ext in ("vtt", "srv3", "ttml", "json3"):
+        for fmt in formats:
+            if fmt.get("ext") == ext:
+                return fmt
+    return formats[0] if formats else None
+
+
+def _parse_subtitle_payload(raw: str, ext: str) -> str:
+    ext = (ext or "vtt").lower()
+    if ext == "json3":
+        import json
+
+        data = json.loads(raw)
+        parts: list[str] = []
+        for event in data.get("events", []):
+            for seg in event.get("segs") or []:
+                chunk = seg.get("utf8", "")
+                if chunk and chunk != "\n":
+                    parts.append(chunk)
+        return re.sub(r"\s+", " ", "".join(parts)).strip()
+
+    lines: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line == "WEBVTT" or "-->" in line:
+            continue
+        if re.fullmatch(r"\d+", line):
+            continue
+        if line.startswith("NOTE") or line.startswith("STYLE"):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        line = unescape(line).strip()
+        if line:
+            lines.append(line)
+
+    deduped: list[str] = []
+    for line in lines:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+    return " ".join(deduped)
+
+
+def _download_ytdlp_subtitle(ydl, formats: list[dict]) -> str:
+    fmt = _pick_subtitle_format(formats)
+    if not fmt or not fmt.get("url"):
+        return ""
+
+    raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", errors="replace")
+    return _parse_subtitle_payload(raw, str(fmt.get("ext", "vtt")))
+
+
+def _extract_ytdlp_transcript(
+    info: dict,
+    ydl,
+    preferred_languages: list[str],
+) -> tuple[str, str]:
+    """Ищет субтитры в метаданных yt-dlp."""
+    for source_name, auto_label in (("subtitles", ""), ("automatic_captions", " (авто)")):
+        tracks: dict = info.get(source_name) or {}
+        if not tracks:
+            continue
+
+        for lang in preferred_languages:
+            if lang in tracks:
+                text = _download_ytdlp_subtitle(ydl, tracks[lang])
+                if text:
+                    return text, f"{lang}{auto_label}"
+
+        for lang, formats in tracks.items():
+            text = _download_ytdlp_subtitle(ydl, formats)
+            if text:
+                return text, f"{lang}{auto_label}"
+
+    return "", ""
+
+
+def _fetch_via_ytdlp(
+    video_id: str,
+    preferred_languages: list[str],
+    max_chars: int,
+) -> tuple[str, str, str, str]:
+    import yt_dlp
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with yt_dlp.YoutubeDL(_ytdlp_options()) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    title = str(info.get("title") or "")
+    description = str(info.get("description") or "")[:1000]
+    transcript_text, language = _extract_ytdlp_transcript(info, ydl, preferred_languages)
+    if transcript_text:
+        transcript_text = _clean_transcript(transcript_text)[:max_chars]
+    return title, description, transcript_text, language
+
+
+def _fetch_via_transcript_api(
+    video_id: str,
+    preferred_languages: list[str],
+    max_chars: int,
+) -> tuple[str, str]:
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    api = YouTubeTranscriptApi()
+    fetched = api.fetch(video_id, languages=preferred_languages)
+    text = " ".join(snippet.text for snippet in fetched)
+    language = getattr(fetched, "language_code", "") or "unknown"
+    return _clean_transcript(text)[:max_chars], language
+
+
 def _fetch_youtube_data_sync(
     video_id: str,
     preferred_languages: list[str],
@@ -229,77 +354,33 @@ def _fetch_youtube_data_sync(
     Синхронная функция для запуска в thread pool.
     Возвращает (title, description, transcript_text, language).
     """
-    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-    from youtube_transcript_api.formatters import TextFormatter
-
     title = ""
     description = ""
     transcript_text = ""
     language = ""
 
-    # Получаем метаданные через yt-dlp если доступен, иначе пропускаем
     try:
-        import yt_dlp
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "extract_flat": False,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(
-                f"https://www.youtube.com/watch?v={video_id}",
-                download=False
+        title, description, transcript_text, language = _fetch_via_ytdlp(
+            video_id,
+            preferred_languages,
+            max_chars,
+        )
+        if transcript_text:
+            logger.info("Субтитры получены через yt-dlp: %s (%s)", video_id, language)
+    except Exception as e:
+        logger.warning("yt-dlp ошибка для %s: %s", video_id, e)
+
+    if not transcript_text:
+        try:
+            transcript_text, language = _fetch_via_transcript_api(
+                video_id,
+                preferred_languages,
+                max_chars,
             )
-            title = info.get("title", "")
-            description = info.get("description", "")[:1000]
-    except Exception as e:
-        logger.debug(f"yt-dlp недоступен или ошибка: {e}")
-        # Продолжаем без метаданных
-
-    # Получаем субтитры
-    try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
-        # Пробуем предпочтительные языки
-        transcript = None
-        for lang in preferred_languages:
-            try:
-                transcript = transcript_list.find_transcript([lang])
-                language = lang
-                break
-            except NoTranscriptFound:
-                continue
-
-        # Если не нашли — берём первый доступный и переводим
-        if transcript is None:
-            try:
-                transcript = transcript_list.find_manually_created_transcript(preferred_languages)
-                language = transcript.language_code
-            except Exception:
-                # Берём любой и пробуем перевести на русский
-                available = list(transcript_list)
-                if available:
-                    transcript = available[0]
-                    language = transcript.language_code
-                    try:
-                        transcript = transcript.translate("ru")
-                        language = "ru (переведено)"
-                    except Exception:
-                        pass  # Оставляем на оригинальном языке
-
-        if transcript:
-            raw_transcript = transcript.fetch()
-            formatter = TextFormatter()
-            full_text = formatter.format_transcript(raw_transcript)
-
-            # Очищаем и обрезаем
-            transcript_text = _clean_transcript(full_text)[:max_chars]
-
-    except TranscriptsDisabled:
-        logger.warning(f"Субтитры отключены для {video_id}")
-    except Exception as e:
-        logger.warning(f"Ошибка получения субтитров {video_id}: {e}")
+            if transcript_text:
+                logger.info("Субтитры получены через transcript-api: %s (%s)", video_id, language)
+        except Exception as e:
+            logger.warning("Ошибка получения субтитров %s: %s", video_id, e)
 
     return title, description, transcript_text, language
 
@@ -327,6 +408,11 @@ def _humanize_youtube_error(error: str) -> str:
         return "Видео с возрастным ограничением — субтитры недоступны без авторизации"
     if "disabled" in error_lower:
         return "Субтитры для этого видео отключены автором"
+    if "blocked" in error_lower or "too many requests" in error_lower:
+        return (
+            "YouTube временно блокирует запросы с сервера. "
+            "Попробуйте позже или перешлите текст/транскрипт вручную."
+        )
     return f"Не удалось получить субтитры: {error[:100]}"
 
 
