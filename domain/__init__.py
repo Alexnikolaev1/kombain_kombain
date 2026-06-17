@@ -1,0 +1,3 @@
+from domain.models_catalog import AVAILABLE_MODEL_IDS, AVAILABLE_MODELS
+
+__all__ = ["AVAILABLE_MODELS", "AVAILABLE_MODEL_IDS"]
