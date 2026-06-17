@@ -11,6 +11,7 @@ from typing import Optional
 from aiogram.types import InlineKeyboardMarkup, Message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000
+CONTENT_PREVIEW_MAX_CHARS = 1200
 
 LOADING_FRAMES = ["⏳", "⌛"]
 LOADING_MESSAGES = [
@@ -81,6 +82,18 @@ def format_generation_message(
     return header + escape_html(response_text)
 
 
+def _truncate_preview(text: str, max_len: int = CONTENT_PREVIEW_MAX_CHARS) -> str:
+    """Обрезает превью по границе слова, если текст длиннее лимита."""
+    normalized = " ".join((text or "").split())
+    if len(normalized) <= max_len:
+        return normalized
+
+    cut = normalized[:max_len]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return f"{cut}…"
+
+
 def format_content_preview(
     *,
     title: str,
@@ -88,14 +101,14 @@ def format_content_preview(
     char_count: int,
 ) -> str:
     """Форматирует превью после успешного парсинга."""
-    preview = content[:300].replace("\n", " ")
+    preview = _truncate_preview(content)
     title_html = escape_html(title) if title else ""
     content_info = f"\n📌 <b>{title_html}</b>" if title else ""
 
     return (
         f"✅ <b>Контент получен!</b>{content_info}\n\n"
         f"📊 Размер: <code>{char_count:,} символов</code>\n"
-        f"📝 Превью: <i>{escape_html(preview)}...</i>\n\n"
+        f"📝 Превью: <i>{escape_html(preview)}</i>\n\n"
         f"<b>Выберите формат обработки:</b>"
     )
 
