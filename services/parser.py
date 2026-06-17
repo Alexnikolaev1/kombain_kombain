@@ -187,7 +187,10 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
                     content="",
                     url=url,
                     title=title,
-                    error="Субтитры недоступны для этого видео. Попробуйте другое.",
+                    error=(
+                        "Субтитры недоступны с сервера (YouTube блокирует облачные IP). "
+                        "Перешлите текст видео боту или добавьте YOUTUBE_PROXY в настройках."
+                    ),
                 )
 
             logger.warning(f"Субтитры не найдены для {video_id}, используем описание")
@@ -220,19 +223,33 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
         )
 
 
-def _ytdlp_options() -> dict:
+def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
     """Опции yt-dlp: без скачивания видео, с обходом типичных ошибок форматов."""
-    return {
+    from config import get_settings
+
+    settings = get_settings()
+    opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": player_clients or ["android", "web"],
             },
         },
     }
+    if settings.YOUTUBE_PROXY:
+        opts["proxy"] = settings.YOUTUBE_PROXY
+    return opts
+
+
+_YTDLP_PLAYER_CLIENTS: list[list[str]] = [
+    ["android", "web"],
+    ["ios", "web"],
+    ["mweb"],
+    ["tv_embedded"],
+]
 
 
 def _language_matches(track_lang: str, preferred: str) -> bool:
@@ -310,9 +327,12 @@ def _parse_subtitle_payload(raw: str, ext: str) -> str:
 
 
 def _download_subtitle_url(url: str) -> str:
-    """Скачивает файл субтитров напрямую — не зависит от жизненного цикла yt-dlp."""
+    """Запасная загрузка субтитров (без cookies yt-dlp)."""
     import urllib.request
 
+    from config import get_settings
+
+    settings = get_settings()
     request = urllib.request.Request(
         url,
         headers={
@@ -323,22 +343,48 @@ def _download_subtitle_url(url: str) -> str:
             "Accept-Language": "ru,en;q=0.9",
         },
     )
+    if settings.YOUTUBE_PROXY:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler(
+                {"http": settings.YOUTUBE_PROXY, "https": settings.YOUTUBE_PROXY}
+            )
+        )
+        with opener.open(request, timeout=30) as response:
+            return response.read().decode("utf-8", errors="replace")
+
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
-def _download_ytdlp_subtitle(formats: list[dict]) -> str:
+def _download_ytdlp_subtitle(ydl, formats: list[dict]) -> str:
     fmt = _pick_subtitle_format(formats)
     if not fmt or not fmt.get("url"):
         return ""
 
-    raw = _download_subtitle_url(fmt["url"])
-    return _parse_subtitle_payload(raw, str(fmt.get("ext", "vtt")))
+    url = fmt["url"]
+    ext = str(fmt.get("ext", "vtt"))
+    raw = ""
+
+    try:
+        raw = ydl.urlopen(url).read().decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.debug("yt-dlp urlopen субтитров не удался: %s", e)
+        try:
+            raw = _download_subtitle_url(url)
+        except Exception as fallback_error:
+            logger.debug("urllib fallback субтитров не удался: %s", fallback_error)
+            return ""
+
+    text = _parse_subtitle_payload(raw, ext)
+    if not text:
+        logger.debug("Пустой разбор субтитров ext=%s url=%s", ext, url[:80])
+    return text
 
 
 def _extract_ytdlp_transcript(
     info: dict,
     preferred_languages: list[str],
+    ydl,
 ) -> tuple[str, str]:
     """Ищет субтитры в метаданных yt-dlp."""
     for source_name, auto_label in (("subtitles", ""), ("automatic_captions", " (авто)")):
@@ -347,9 +393,16 @@ def _extract_ytdlp_transcript(
             continue
 
         for lang, formats in _iter_tracks_in_order(tracks, preferred_languages):
-            text = _download_ytdlp_subtitle(formats)
+            text = _download_ytdlp_subtitle(ydl, formats)
             if text:
                 return text, f"{lang}{auto_label}"
+
+        logger.warning(
+            "Дорожки %s найдены (%s), но текст не извлечён для %s",
+            source_name,
+            ", ".join(list(tracks.keys())[:6]),
+            info.get("id", "?"),
+        )
 
     return "", ""
 
@@ -362,15 +415,41 @@ def _fetch_via_ytdlp(
     import yt_dlp
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL(_ytdlp_options()) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = str(info.get("title") or "")
-        description = str(info.get("description") or "")[:1000]
-        transcript_text, language = _extract_ytdlp_transcript(info, preferred_languages)
+    title = ""
+    description = ""
+    last_error: Exception | None = None
 
-    if transcript_text:
-        transcript_text = _clean_transcript(transcript_text)[:max_chars]
-    return title, description, transcript_text, language
+    for player_clients in _YTDLP_PLAYER_CLIENTS:
+        try:
+            with yt_dlp.YoutubeDL(_ytdlp_options(player_clients)) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = str(info.get("title") or "")
+                description = str(info.get("description") or "")[:1000]
+                transcript_text, language = _extract_ytdlp_transcript(
+                    info,
+                    preferred_languages,
+                    ydl,
+                )
+                if transcript_text:
+                    transcript_text = _clean_transcript(transcript_text)[:max_chars]
+                    logger.debug(
+                        "yt-dlp player_client=%s сработал для %s",
+                        player_clients,
+                        video_id,
+                    )
+                    return title, description, transcript_text, language
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "yt-dlp player_client=%s ошибка для %s: %s",
+                player_clients,
+                video_id,
+                e,
+            )
+
+    if last_error:
+        raise last_error
+    return title, description, "", ""
 
 
 def _fetch_via_transcript_api(
@@ -428,16 +507,33 @@ def _fetch_youtube_data_sync(
         logger.warning("yt-dlp ошибка для %s: %s", video_id, e)
 
     if not transcript_text:
-        try:
-            transcript_text, language = _fetch_via_transcript_api(
-                video_id,
-                preferred_languages,
-                max_chars,
-            )
-            if transcript_text:
-                logger.info("Субтитры получены через transcript-api: %s (%s)", video_id, language)
-        except Exception as e:
-            logger.warning("Ошибка получения субтитров %s: %s", video_id, e)
+        from config import get_settings
+
+        settings = get_settings()
+        if settings.YOUTUBE_USE_TRANSCRIPT_API:
+            try:
+                transcript_text, language = _fetch_via_transcript_api(
+                    video_id,
+                    preferred_languages,
+                    max_chars,
+                )
+                if transcript_text:
+                    logger.info(
+                        "Субтитры получены через transcript-api: %s (%s)",
+                        video_id,
+                        language,
+                    )
+            except Exception as e:
+                error_text = str(e)
+                if "blocking requests from your IP" in error_text:
+                    logger.warning(
+                        "transcript-api заблокирован YouTube для %s (типично для облака)",
+                        video_id,
+                    )
+                else:
+                    logger.warning("Ошибка получения субтитров %s: %s", video_id, e)
+        else:
+            logger.info("transcript-api отключён, пропускаем fallback для %s", video_id)
 
     return title, description, transcript_text, language
 

@@ -108,6 +108,10 @@ class Settings:
     YOUTUBE_TRANSCRIPT_LANGUAGES: list = field(
         default_factory=lambda: ["ru", "en", "uk"]  # Приоритет языков субтитров
     )
+    YOUTUBE_PROXY: str = field(default_factory=lambda: os.getenv("YOUTUBE_PROXY", ""))
+    YOUTUBE_USE_TRANSCRIPT_API: bool = (
+        os.getenv("YOUTUBE_USE_TRANSCRIPT_API", "true").lower() == "true"
+    )
 
     # Идентификация приложения для OpenRouter (обязательно для их ToS)
     APP_NAME: str = "AI-Kombain-Bot"
