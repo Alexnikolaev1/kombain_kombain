@@ -69,3 +69,11 @@ def test_language_matches_region_codes():
     assert _language_matches("ru-RU", "ru")
     assert _language_matches("en-US", "en")
     assert not _language_matches("de", "ru")
+
+
+def test_placeholder_proxy_is_ignored():
+    from services.parser import _is_placeholder_proxy, get_effective_youtube_proxy
+
+    assert _is_placeholder_proxy("http://user:pass@host:port")
+    assert _is_placeholder_proxy("")
+    assert not _is_placeholder_proxy("socks5://real:secret@proxy.example.com:1080")

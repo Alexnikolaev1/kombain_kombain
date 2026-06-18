@@ -223,11 +223,48 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
         )
 
 
-def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
-    """Опции yt-dlp: без скачивания видео, с обходом типичных ошибок форматов."""
+def _is_placeholder_proxy(proxy: str) -> bool:
+    """Отсекает примеры из документации, случайно вставленные в Railway."""
+    lowered = proxy.strip().lower()
+    if not lowered:
+        return True
+
+    placeholder_markers = (
+        "user:pass@host:port",
+        "@host:port",
+        "your_",
+        "changeme",
+    )
+    if any(marker in lowered for marker in placeholder_markers):
+        return True
+
+    parsed = urlparse(proxy)
+    if parsed.scheme not in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}:
+        return True
+    hostname = (parsed.hostname or "").lower()
+    if not hostname or hostname in {"host", "localhost", "example.com"}:
+        return True
+    return False
+
+
+def get_effective_youtube_proxy() -> str:
+    """Возвращает рабочий прокси или пустую строку."""
     from config import get_settings
 
-    settings = get_settings()
+    raw = (get_settings().YOUTUBE_PROXY or "").strip()
+    if not raw:
+        return ""
+    if _is_placeholder_proxy(raw):
+        logger.warning(
+            "YOUTUBE_PROXY похож на пример/заглушку — игнорируем: %s",
+            raw,
+        )
+        return ""
+    return raw
+
+
+def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
+    """Опции yt-dlp: без скачивания видео, с обходом типичных ошибок форматов."""
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
@@ -239,8 +276,9 @@ def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
             },
         },
     }
-    if settings.YOUTUBE_PROXY:
-        opts["proxy"] = settings.YOUTUBE_PROXY
+    proxy = get_effective_youtube_proxy()
+    if proxy:
+        opts["proxy"] = proxy
     return opts
 
 
@@ -330,9 +368,7 @@ def _download_subtitle_url(url: str) -> str:
     """Запасная загрузка субтитров (без cookies yt-dlp)."""
     import urllib.request
 
-    from config import get_settings
-
-    settings = get_settings()
+    proxy = get_effective_youtube_proxy()
     request = urllib.request.Request(
         url,
         headers={
@@ -343,11 +379,9 @@ def _download_subtitle_url(url: str) -> str:
             "Accept-Language": "ru,en;q=0.9",
         },
     )
-    if settings.YOUTUBE_PROXY:
+    if proxy:
         opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler(
-                {"http": settings.YOUTUBE_PROXY, "https": settings.YOUTUBE_PROXY}
-            )
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
         with opener.open(request, timeout=30) as response:
             return response.read().decode("utf-8", errors="replace")
