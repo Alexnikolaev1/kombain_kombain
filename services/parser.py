@@ -20,6 +20,8 @@ from html import unescape
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
+from pathlib import Path
+
 import httpx
 
 logger = logging.getLogger("ai_kombain.parser")
@@ -280,6 +282,88 @@ def _is_youtube_bot_error(exc: BaseException) -> bool:
     return "sign in to confirm" in text or "not a bot" in text
 
 
+def _normalize_b64(value: str) -> str:
+    """Убирает переносы строк — Railway иногда вставляет base64 с разбивкой."""
+    return re.sub(r"\s+", "", (value or "").strip())
+
+
+def _inspect_youtube_cookiefile(path: Path) -> dict[str, bool | int]:
+    """Проверяет Netscape cookies на наличие ключевых YouTube-полей."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"youtube_lines": 0, "has_sid": False, "has_login": False, "valid": False}
+
+    lines = [line for line in content.splitlines() if line.strip() and not line.startswith("#")]
+    youtube_lines = [line for line in lines if "youtube.com" in line]
+    has_sid = any(
+        "\tSID\t" in line or "\t__Secure-1PSID\t" in line or "\t__Secure-3PSID\t" in line
+        for line in youtube_lines
+    )
+    has_login = any("\tLOGIN_INFO\t" in line for line in youtube_lines)
+    valid = bool(youtube_lines) and has_sid
+
+    return {
+        "youtube_lines": len(youtube_lines),
+        "has_sid": has_sid,
+        "has_login": has_login,
+        "valid": valid,
+    }
+
+
+def log_youtube_cookie_status() -> None:
+    """Диагностика при старте бота — сразу видно, почему YouTube может не работать."""
+    from config import get_settings
+
+    settings = get_settings()
+    raw_b64 = settings.YOUTUBE_COOKIES_B64.strip()
+    file_path = settings.YOUTUBE_COOKIES_FILE.strip()
+
+    if file_path:
+        path = Path(file_path)
+        if path.is_file():
+            info = _inspect_youtube_cookiefile(path)
+            logger.info(
+                "YouTube cookies (file): %s строк, SID=%s, LOGIN_INFO=%s",
+                info["youtube_lines"],
+                info["has_sid"],
+                info["has_login"],
+            )
+            if not info["valid"]:
+                logger.warning("YouTube cookies file выглядит неполным — обновите экспорт")
+            return
+        logger.warning("YOUTUBE_COOKIES_FILE не найден: %s", file_path)
+
+    if not raw_b64:
+        logger.warning(
+            "YouTube cookies НЕ заданы (YOUTUBE_COOKIES_B64 пуст) — "
+            "облачный IP Railway будет получать bot-check"
+        )
+        return
+
+    cookiefile = _get_youtube_cookiefile()
+    if not cookiefile:
+        logger.error(
+            "YOUTUBE_COOKIES_B64 задан (%s символов), но декодирование не удалось — "
+            "проверьте base64 (без кавычек, одной строкой)",
+            len(_normalize_b64(raw_b64)),
+        )
+        return
+
+    info = _inspect_youtube_cookiefile(Path(cookiefile))
+    logger.info(
+        "YouTube cookies (b64): %s строк, SID=%s, LOGIN_INFO=%s → %s",
+        info["youtube_lines"],
+        info["has_sid"],
+        info["has_login"],
+        cookiefile,
+    )
+    if not info["valid"]:
+        logger.warning(
+            "YouTube cookies без SID — экспортируйте заново из браузера, залогиненного в YouTube"
+        )
+
+
 def _get_youtube_cookiefile() -> str:
     """Путь к cookies.txt (Netscape) для yt-dlp."""
     import base64
@@ -295,13 +379,40 @@ def _get_youtube_cookiefile() -> str:
             return str(path)
         logger.warning("YOUTUBE_COOKIES_FILE не найден: %s", path)
 
-    if settings.YOUTUBE_COOKIES_B64.strip():
+    raw_b64 = settings.YOUTUBE_COOKIES_B64.strip()
+    if raw_b64:
+        normalized = _normalize_b64(raw_b64)
         cookies_path = Path(__file__).resolve().parent.parent / "data" / "youtube_cookies.txt"
+        try:
+            decoded = base64.b64decode(normalized, validate=False)
+        except Exception as exc:
+            logger.error("Не удалось декодировать YOUTUBE_COOKIES_B64: %s", exc)
+            return ""
+
+        if not decoded.strip():
+            logger.error("YOUTUBE_COOKIES_B64 декодировался в пустой файл")
+            return ""
+
         cookies_path.parent.mkdir(parents=True, exist_ok=True)
-        cookies_path.write_bytes(base64.b64decode(settings.YOUTUBE_COOKIES_B64.strip()))
+        cookies_path.write_bytes(decoded)
+
+        info = _inspect_youtube_cookiefile(cookies_path)
+        if not info["valid"]:
+            logger.warning(
+                "Декодированные cookies слабые: youtube_lines=%s, has_sid=%s",
+                info["youtube_lines"],
+                info["has_sid"],
+            )
         return str(cookies_path)
 
     return ""
+
+
+def _primary_ytdlp_player_clients() -> list[str]:
+    """С cookies лучше web-клиент; android часто игнорирует авторизацию."""
+    if _get_youtube_cookiefile():
+        return ["web", "mweb"]
+    return ["android", "web"]
 
 
 def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
@@ -323,12 +434,11 @@ def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
     cookiefile = _get_youtube_cookiefile()
     if cookiefile:
         opts["cookiefile"] = cookiefile
+        logger.debug("yt-dlp cookiefile: %s", cookiefile)
     return opts
 
 
-# Как в первом рабочем деплое — один проход android+web.
-_YTDLP_PLAYER_CLIENTS_PRIMARY: list[list[str]] = [["android", "web"]]
-# Дополнительные client'ы — только если нет bot-check (иначе усугубляем блокировку IP).
+# Как в первом рабочем деплое — один проход (web при cookies, android без).
 _YTDLP_PLAYER_CLIENTS_FALLBACK: list[list[str]] = [["ios", "web"], ["mweb"]]
 
 
@@ -496,11 +606,9 @@ def _fetch_via_ytdlp(
     last_error: Exception | None = None
     bot_blocked = False
 
-    client_chain = list(_YTDLP_PLAYER_CLIENTS_PRIMARY)
-    if _get_youtube_cookiefile():
-        # С cookies достаточно основного прохода — не долбим YouTube лишний раз.
-        pass
-    else:
+    has_cookies = bool(_get_youtube_cookiefile())
+    client_chain = [_primary_ytdlp_player_clients()]
+    if not has_cookies:
         client_chain.extend(_YTDLP_PLAYER_CLIENTS_FALLBACK)
 
     for player_clients in client_chain:
@@ -535,9 +643,16 @@ def _fetch_via_ytdlp(
             )
 
     if bot_blocked:
+        if has_cookies:
+            raise YouTubeBotCheckError(
+                "YouTube cookies устарели или не подходят для IP сервера. "
+                "Экспортируйте свежие cookies из браузера (нужен аккаунт YouTube) "
+                "и обновите YOUTUBE_COOKIES_B64 в Railway."
+            )
         raise YouTubeBotCheckError(
-            "YouTube требует авторизацию с IP сервера. "
-            "Добавьте YOUTUBE_COOKIES_B64 в Railway или перешлите текст видео боту."
+            "YouTube блокирует облачный IP. "
+            "Добавьте YOUTUBE_COOKIES_B64 в Railway Variables "
+            "или перешлите текст видео боту."
         )
     if last_error:
         raise last_error

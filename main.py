@@ -26,6 +26,10 @@ async def main() -> None:
 
     await init_db()
 
+    from services.parser import log_youtube_cookie_status
+
+    log_youtube_cookie_status()
+
     bot = Bot(
         token=app_settings.TELEGRAM_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),

@@ -87,3 +87,42 @@ def test_youtube_bot_error_detection():
     )
     assert not _is_youtube_bot_error(Exception("format not available"))
     assert issubclass(YouTubeBotCheckError, Exception)
+
+
+def test_normalize_b64_strips_whitespace():
+    from services.parser import _normalize_b64
+
+    assert _normalize_b64("YQ==\n") == "YQ=="
+    assert _normalize_b64("  Y W J  ") == "YWJ"
+
+
+def test_primary_player_clients_with_cookies(tmp_path, monkeypatch):
+    from config import get_settings
+    from services.parser import _primary_ytdlp_player_clients
+
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t0\t__Secure-1PSID\ttest\n",
+        encoding="utf-8",
+    )
+    settings = get_settings()
+    monkeypatch.setattr(settings, "YOUTUBE_COOKIES_FILE", str(cookie_file))
+    monkeypatch.setattr(settings, "YOUTUBE_COOKIES_B64", "")
+
+    assert _primary_ytdlp_player_clients() == ["web", "mweb"]
+
+
+def test_inspect_youtube_cookiefile(tmp_path):
+    from services.parser import _inspect_youtube_cookiefile
+
+    path = tmp_path / "cookies.txt"
+    path.write_text(
+        "# Netscape\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t0\tSID\tx\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t0\tLOGIN_INFO\ty\n",
+        encoding="utf-8",
+    )
+    info = _inspect_youtube_cookiefile(path)
+    assert info["valid"] is True
+    assert info["has_login"] is True
