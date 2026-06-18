@@ -11,7 +11,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
-from application.dto import ContentSession
+from application.dto import ContentSession, GenerationOutcome
 from application.use_cases import (
     SOURCE_TYPE_MAP,
     ContentIntakeUseCase,
