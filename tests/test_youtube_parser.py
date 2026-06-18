@@ -72,8 +72,18 @@ def test_language_matches_region_codes():
 
 
 def test_placeholder_proxy_is_ignored():
-    from services.parser import _is_placeholder_proxy, get_effective_youtube_proxy
+    from services.parser import _is_placeholder_proxy
 
     assert _is_placeholder_proxy("http://user:pass@host:port")
     assert _is_placeholder_proxy("")
     assert not _is_placeholder_proxy("socks5://real:secret@proxy.example.com:1080")
+
+
+def test_youtube_bot_error_detection():
+    from services.parser import YouTubeBotCheckError, _is_youtube_bot_error
+
+    assert _is_youtube_bot_error(
+        Exception("Sign in to confirm you're not a bot")
+    )
+    assert not _is_youtube_bot_error(Exception("format not available"))
+    assert issubclass(YouTubeBotCheckError, Exception)

@@ -24,6 +24,10 @@ import httpx
 
 logger = logging.getLogger("ai_kombain.parser")
 
+
+class YouTubeBotCheckError(Exception):
+    """YouTube требует captcha/cookies с IP сервера."""
+
 TELEGRAM_FETCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; AIKombainBot/1.0; "
@@ -188,8 +192,9 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
                     url=url,
                     title=title,
                     error=(
-                        "Субтитры недоступны с сервера (YouTube блокирует облачные IP). "
-                        "Перешлите текст видео боту или добавьте YOUTUBE_PROXY в настройках."
+                        "Субтитры недоступны с сервера. YouTube блокирует облачные IP. "
+                        "Добавьте YOUTUBE_COOKIES_B64 в Railway, реальный YOUTUBE_PROXY "
+                        "или перешлите текст видео боту."
                     ),
                 )
 
@@ -212,6 +217,13 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
             language=language,
         )
 
+    except YouTubeBotCheckError as e:
+        return ParsedContent(
+            source_type=SourceType.YOUTUBE,
+            content="",
+            url=url,
+            error=str(e),
+        )
     except Exception as e:
         error_msg = _humanize_youtube_error(str(e))
         logger.error(f"Ошибка парсинга YouTube {video_id}: {e}")
@@ -263,6 +275,35 @@ def get_effective_youtube_proxy() -> str:
     return raw
 
 
+def _is_youtube_bot_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "sign in to confirm" in text or "not a bot" in text
+
+
+def _get_youtube_cookiefile() -> str:
+    """Путь к cookies.txt (Netscape) для yt-dlp."""
+    import base64
+    from pathlib import Path
+
+    from config import get_settings
+
+    settings = get_settings()
+
+    if settings.YOUTUBE_COOKIES_FILE:
+        path = Path(settings.YOUTUBE_COOKIES_FILE)
+        if path.is_file():
+            return str(path)
+        logger.warning("YOUTUBE_COOKIES_FILE не найден: %s", path)
+
+    if settings.YOUTUBE_COOKIES_B64.strip():
+        cookies_path = Path(__file__).resolve().parent.parent / "data" / "youtube_cookies.txt"
+        cookies_path.parent.mkdir(parents=True, exist_ok=True)
+        cookies_path.write_bytes(base64.b64decode(settings.YOUTUBE_COOKIES_B64.strip()))
+        return str(cookies_path)
+
+    return ""
+
+
 def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
     """Опции yt-dlp: без скачивания видео, с обходом типичных ошибок форматов."""
     opts: dict = {
@@ -279,15 +320,16 @@ def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
     proxy = get_effective_youtube_proxy()
     if proxy:
         opts["proxy"] = proxy
+    cookiefile = _get_youtube_cookiefile()
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
     return opts
 
 
-_YTDLP_PLAYER_CLIENTS: list[list[str]] = [
-    ["android", "web"],
-    ["ios", "web"],
-    ["mweb"],
-    ["tv_embedded"],
-]
+# Как в первом рабочем деплое — один проход android+web.
+_YTDLP_PLAYER_CLIENTS_PRIMARY: list[list[str]] = [["android", "web"]]
+# Дополнительные client'ы — только если нет bot-check (иначе усугубляем блокировку IP).
+_YTDLP_PLAYER_CLIENTS_FALLBACK: list[list[str]] = [["ios", "web"], ["mweb"]]
 
 
 def _language_matches(track_lang: str, preferred: str) -> bool:
@@ -452,8 +494,16 @@ def _fetch_via_ytdlp(
     title = ""
     description = ""
     last_error: Exception | None = None
+    bot_blocked = False
 
-    for player_clients in _YTDLP_PLAYER_CLIENTS:
+    client_chain = list(_YTDLP_PLAYER_CLIENTS_PRIMARY)
+    if _get_youtube_cookiefile():
+        # С cookies достаточно основного прохода — не долбим YouTube лишний раз.
+        pass
+    else:
+        client_chain.extend(_YTDLP_PLAYER_CLIENTS_FALLBACK)
+
+    for player_clients in client_chain:
         try:
             with yt_dlp.YoutubeDL(_ytdlp_options(player_clients)) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -466,14 +516,17 @@ def _fetch_via_ytdlp(
                 )
                 if transcript_text:
                     transcript_text = _clean_transcript(transcript_text)[:max_chars]
-                    logger.debug(
-                        "yt-dlp player_client=%s сработал для %s",
-                        player_clients,
-                        video_id,
-                    )
                     return title, description, transcript_text, language
         except Exception as e:
             last_error = e
+            if _is_youtube_bot_error(e):
+                bot_blocked = True
+                logger.warning(
+                    "YouTube bot-check для %s — прекращаем попытки (client=%s)",
+                    video_id,
+                    player_clients,
+                )
+                break
             logger.warning(
                 "yt-dlp player_client=%s ошибка для %s: %s",
                 player_clients,
@@ -481,6 +534,11 @@ def _fetch_via_ytdlp(
                 e,
             )
 
+    if bot_blocked:
+        raise YouTubeBotCheckError(
+            "YouTube требует авторизацию с IP сервера. "
+            "Добавьте YOUTUBE_COOKIES_B64 в Railway или перешлите текст видео боту."
+        )
     if last_error:
         raise last_error
     return title, description, "", ""
@@ -529,6 +587,8 @@ def _fetch_youtube_data_sync(
     transcript_text = ""
     language = ""
 
+    bot_blocked = False
+
     try:
         title, description, transcript_text, language = _fetch_via_ytdlp(
             video_id,
@@ -537,10 +597,13 @@ def _fetch_youtube_data_sync(
         )
         if transcript_text:
             logger.info("Субтитры получены через yt-dlp: %s (%s)", video_id, language)
+    except YouTubeBotCheckError:
+        bot_blocked = True
+        raise
     except Exception as e:
         logger.warning("yt-dlp ошибка для %s: %s", video_id, e)
 
-    if not transcript_text:
+    if not transcript_text and not bot_blocked:
         from config import get_settings
 
         settings = get_settings()

@@ -112,6 +112,9 @@ class Settings:
     YOUTUBE_USE_TRANSCRIPT_API: bool = (
         os.getenv("YOUTUBE_USE_TRANSCRIPT_API", "true").lower() == "true"
     )
+    # Cookies YouTube (Netscape cookies.txt) — обход bot-check на облачных IP
+    YOUTUBE_COOKIES_FILE: str = field(default_factory=lambda: os.getenv("YOUTUBE_COOKIES_FILE", ""))
+    YOUTUBE_COOKIES_B64: str = field(default_factory=lambda: os.getenv("YOUTUBE_COOKIES_B64", ""))
 
     # Идентификация приложения для OpenRouter (обязательно для их ToS)
     APP_NAME: str = "AI-Kombain-Bot"
