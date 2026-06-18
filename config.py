@@ -66,6 +66,29 @@ class Settings:
         default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     )
 
+    # Gemini TTS (бесплатно через AI Studio — gemini-3.1-flash-tts-preview)
+    GEMINI_TTS_MODEL: str = field(
+        default_factory=lambda: os.getenv(
+            "GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"
+        )
+    )
+    GEMINI_TTS_VOICE: str = field(
+        default_factory=lambda: os.getenv("GEMINI_TTS_VOICE", "Kore")
+    )
+    GEMINI_TTS_LANGUAGE: str = field(
+        default_factory=lambda: os.getenv("GEMINI_TTS_LANGUAGE", "ru-RU")
+    )
+
+    # Pexels — бесплатный сток B-roll (опционально; без ключа — цветной фон)
+    PEXELS_API_KEY: str = field(default_factory=lambda: os.getenv("PEXELS_API_KEY", ""))
+
+    # Автосборка Reels (Фаза 2)
+    REELS_RENDER_ENABLED: bool = (
+        os.getenv("REELS_RENDER_ENABLED", "true").lower() == "true"
+    )
+    REELS_RENDER_MAX_SCENES: int = int(os.getenv("REELS_RENDER_MAX_SCENES", "8"))
+    REELS_VIDEO_MAX_MB: int = int(os.getenv("REELS_VIDEO_MAX_MB", "45"))
+
     # Модель по умолчанию
     DEFAULT_MODEL: str = field(
         default_factory=lambda: os.getenv("DEFAULT_MODEL", "google/gemini-2.5-flash")

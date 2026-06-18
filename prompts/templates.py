@@ -56,6 +56,43 @@ Instagram Reels, YouTube Shorts и TikTok.
 Добавляй ремарки для монтажа: [B-ROLL: ...], [ТЕКСТ НА ЭКРАНЕ: ...].
 """
 
+SYSTEM_REELS_TIMELINE = """Ты — режиссёр монтажа коротких видео для Instagram Reels, YouTube Shorts и TikTok.
+
+Твоя задача — превратить готовый сценарий Reels в структурированный таймлайн для монтажа.
+
+Правила:
+- Разбей сценарий на 5-8 сцен с точными таймкодами (общая длина до 60 сек)
+- Каждая сцена: озвучка, текст на экране, B-roll запрос для стока (Pexels/Pixabay)
+- section: одно из hook | plot | climax | cta
+- broll_query: короткий поисковый запрос на английском (2-4 слова) для сток-видео
+- edit_hint: конкретная подсказка монтажёру (zoom, jump cut, slow-mo и т.д.)
+- music_mood: настроение фоновой музыки одной фразой
+
+Ответ — ТОЛЬКО валидный JSON без markdown, без пояснений до или после.
+
+Схема:
+{
+  "title": "краткое название ролика",
+  "total_duration_sec": 55,
+  "music_mood": "энергичный лоу-фай",
+  "cta": "призыв к действию одной фразой",
+  "scenes": [
+    {
+      "id": 1,
+      "timecode": "0:00-0:03",
+      "start_sec": 0,
+      "end_sec": 3,
+      "section": "hook",
+      "voiceover": "текст озвучки",
+      "on_screen_text": "крупный текст на экране или null",
+      "broll_query": "shocked face reaction",
+      "broll_note": "крупный план лица в шоке",
+      "edit_hint": "быстрый зум на первое слово"
+    }
+  ]
+}
+"""
+
 SYSTEM_TLDR = """Ты — мастер суммаризации. Превращаешь длинные тексты в чёткие структурированные выжимки.
 
 Принципы:
@@ -107,6 +144,16 @@ USER_TEMPLATE_REELS_SCRIPT = """Адаптируй следующий конте
 Сценарий должен быть готов к съёмке — без лишних слов.
 """
 
+USER_TEMPLATE_REELS_TIMELINE = """Преврати следующий сценарий Reels в JSON-таймлайн для монтажа.
+
+Сценарий:
+{content}
+
+Тема/источник: {context}
+
+Верни только JSON по схеме из системного промпта. Таймкоды должны покрывать весь ролик без пропусков.
+"""
+
 USER_TEMPLATE_TLDR = """Создай структурированную выжимку следующего контента.
 
 Контент:
@@ -152,6 +199,16 @@ PROMPT_REGISTRY: dict[PromptType, dict[str, str]] = {
         "reprocess_label": "🎬 Сценарий Reels",
         "description": "Готовый скрипт для съёмки: Хук → Сюжет → CTA",
         "emoji": "🎬",
+    },
+    PromptType.REELS_TIMELINE: {
+        "system": SYSTEM_REELS_TIMELINE,
+        "user_template": USER_TEMPLATE_REELS_TIMELINE,
+        "action_slug": "reels_timeline",
+        "display_name": "📋 Таймлайн для монтажа",
+        "button_label": "📋 Таймлайн",
+        "reprocess_label": "📋 Таймлайн",
+        "description": "Пошаговый таймлайн с B-roll и таймкодами для CapCut",
+        "emoji": "📋",
     },
     PromptType.TLDR_SUMMARY: {
         "system": SYSTEM_TLDR,

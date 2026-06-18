@@ -5,13 +5,19 @@ application/use_cases.py — бизнес-сценарии без привязк
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Optional
 
 from application.dto import ContentSession, GenerationOutcome
-from db.database import get_session, increment_user_stats
+from config import get_settings
+from db.database import check_daily_limit, get_session, increment_user_stats, log_usage_stat
 from db.models import ContentSource, PromptType
-from services.llm_client import process_content
+from services.llm_client import DailyLimitExceededError, process_content
 from services.parser import ParsedContent, parse_input
+from services.reels_renderer import render_reels_video
+from services.reels_timeline import ReelsTimeline
 
 logger = logging.getLogger("ai_kombain.application")
 
@@ -81,3 +87,86 @@ class GenerationUseCase:
             outcome.processing_ms,
         )
         return outcome
+
+    async def run_timeline(
+        self,
+        *,
+        user_id: int,
+        script_text: str,
+        context: str,
+        source_url: str = "",
+        source_type: ContentSource | None = None,
+    ) -> GenerationOutcome:
+        """Генерация таймлайна монтажа из готового сценария Reels."""
+        result = await process_content(
+            content=script_text,
+            prompt_type=PromptType.REELS_TIMELINE,
+            context=context,
+            source_url=source_url,
+            user_id=user_id,
+            source_type=source_type,
+        )
+
+        async with get_session() as db_session:
+            await increment_user_stats(
+                session=db_session,
+                user_id=user_id,
+                tokens_saved=result.get("tokens_saved", 0),
+                was_cache_hit=result.get("was_cached", False),
+            )
+
+        outcome = GenerationOutcome.from_result(result, action="reels_timeline")
+        logger.info(
+            "Таймлайн сгенерирован: user=%s cached=%s ms=%.0f",
+            user_id,
+            outcome.was_cached,
+            outcome.processing_ms,
+        )
+        return outcome
+
+
+ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+class ReelsRenderUseCase:
+    """Автосборка MP4 Reels из таймлайна (TTS + B-roll + FFmpeg)."""
+
+    async def run(
+        self,
+        *,
+        user_id: int,
+        timeline: ReelsTimeline,
+        source_url: str = "",
+        source_type: ContentSource | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> tuple[Path, float]:
+        settings = get_settings()
+        start = time.monotonic()
+
+        async with get_session() as db_session:
+            allowed, _ = await check_daily_limit(db_session, user_id)
+            if not allowed:
+                raise DailyLimitExceededError(
+                    f"Дневной лимит ({settings.DAILY_REQUEST_LIMIT}) исчерпан. "
+                    "Попробуйте завтра."
+                )
+
+        output_path = await render_reels_video(timeline, on_progress=on_progress)
+        elapsed_ms = (time.monotonic() - start) * 1000
+
+        async with get_session() as db_session:
+            await increment_user_stats(session=db_session, user_id=user_id)
+            await log_usage_stat(
+                db_session,
+                user_id=user_id,
+                prompt_type=PromptType.REELS_RENDER,
+                source_type=source_type,
+                source_url=source_url or None,
+                was_cached=False,
+                processing_ms=elapsed_ms,
+                model_used=settings.GEMINI_TTS_MODEL,
+                success=True,
+            )
+
+        logger.info("Reels MP4 собран: user=%s ms=%.0f", user_id, elapsed_ms)
+        return output_path, elapsed_ms

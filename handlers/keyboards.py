@@ -10,6 +10,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
+from config import get_settings
 from domain.models_catalog import AVAILABLE_MODELS
 from prompts.templates import (
     ACTION_SLUG_BY_TYPE,
@@ -74,9 +75,34 @@ def get_action_keyboard(source_type: str = "youtube") -> InlineKeyboardMarkup:
     return _build_prompt_keyboard("action")
 
 
-def get_result_keyboard(has_cache_info: bool = False) -> InlineKeyboardMarkup:
-    del has_cache_info
+def reels_render_available() -> bool:
+    settings = get_settings()
+    return settings.REELS_RENDER_ENABLED and bool(settings.GEMINI_API_KEY)
+
+
+def get_result_keyboard(
+    *,
+    show_timeline: bool = False,
+    show_render: bool = False,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    action_row: list[InlineKeyboardButton] = []
+    if show_timeline:
+        action_row.append(
+            InlineKeyboardButton(
+                text="📋 Таймлайн для монтажа",
+                callback_data="result:reels_timeline",
+            ),
+        )
+    if show_render and reels_render_available():
+        action_row.append(
+            InlineKeyboardButton(
+                text="🎬 Собрать Reels",
+                callback_data="result:reels_render",
+            ),
+        )
+    if action_row:
+        builder.row(*action_row)
     builder.row(
         InlineKeyboardButton(text="🔄 Другой формат", callback_data="result:reprocess"),
         InlineKeyboardButton(text="📋 Скопировать", callback_data="result:copy_hint"),

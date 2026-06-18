@@ -32,6 +32,8 @@ class PromptType(PyEnum):
     VIRAL_TITLES   = "viral_titles"    # Виральные заголовки
     DEEP_ANALYSIS  = "deep_analysis"   # Смысловой анализ и тезисы
     REELS_SCRIPT   = "reels_script"    # Сценарий Reels/Shorts
+    REELS_TIMELINE = "reels_timeline"  # Таймлайн монтажа из сценария Reels
+    REELS_RENDER   = "reels_render"    # Автосборка MP4 Reels
     TLDR_SUMMARY   = "tldr_summary"    # Краткая суммаризация (TL;DR)
 
 
