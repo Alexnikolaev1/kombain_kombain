@@ -1,8 +1,5 @@
 """
 services/gemini_tts.py — озвучка сцен через Gemini TTS (AI Studio).
-
-Модель по умолчанию: gemini-2.5-flash-preview-tts
-Альтернатива: gemini-2.5-flash-preview-tts / gemini-3.1-flash-tts-preview
 """
 
 from __future__ import annotations
@@ -22,12 +19,14 @@ from services.llm_errors import LLMError, LLMRateLimitError
 
 logger = logging.getLogger("ai_kombain.gemini_tts")
 
+# 2.5 обычно мягче по квоте, чем preview 3.1
 TTS_MODEL_FALLBACKS = (
     "gemini-2.5-flash-preview-tts",
     "gemini-3.1-flash-tts-preview",
 )
 
-_tts_semaphore = asyncio.Semaphore(2)
+# Строго по одному TTS-запросу — меньше 429 на бесплатном tier
+_tts_semaphore = asyncio.Semaphore(1)
 
 
 class GeminiTTSError(LLMError):
@@ -83,6 +82,15 @@ def _build_tts_prompt(text: str) -> str:
     )
 
 
+def _tts_models_to_try() -> list[str]:
+    settings = get_settings()
+    models: list[str] = []
+    for candidate in (settings.GEMINI_TTS_MODEL, *TTS_MODEL_FALLBACKS):
+        if candidate and candidate not in models:
+            models.append(candidate)
+    return models
+
+
 async def _call_tts_model(model: str, prompt: str) -> tuple[bytes, str]:
     settings = get_settings()
     if not settings.GEMINI_API_KEY:
@@ -115,7 +123,9 @@ async def _call_tts_model(model: str, prompt: str) -> tuple[bytes, str]:
         raise GeminiTTSError("Не удалось подключиться к Gemini TTS")
 
     if response.status_code == 429:
-        raise LLMRateLimitError("Лимит Gemini TTS. Попробуйте позже.")
+        raise LLMRateLimitError(
+            "Лимит Gemini TTS (бесплатный tier). Бот подождёт и повторит автоматически."
+        )
 
     if response.status_code == 404:
         raise GeminiTTSError(f"Модель TTS недоступна: {model}")
@@ -144,38 +154,48 @@ async def _call_tts_model(model: str, prompt: str) -> tuple[bytes, str]:
 async def synthesize_speech_to_wav(text: str, output_path: Path) -> float:
     """
     Синтезирует озвучку сцены и сохраняет WAV.
-    Возвращает длительность в секундах.
+    При 429 — экспоненциальный backoff и смена TTS-модели.
     """
     settings = get_settings()
     prompt = _build_tts_prompt(text)
-
-    models_to_try: list[str] = []
-    for candidate in (settings.GEMINI_TTS_MODEL, *TTS_MODEL_FALLBACKS):
-        if candidate and candidate not in models_to_try:
-            models_to_try.append(candidate)
-
+    models = _tts_models_to_try()
     last_error: Exception | None = None
+
     async with _tts_semaphore:
-        for model in models_to_try:
-            try:
-                pcm, mime = await _call_tts_model(model, prompt)
-                rate, channels = _parse_pcm_from_mime(mime)
-                write_pcm_as_wav(pcm, output_path, rate=rate, channels=channels)
-                duration = wav_duration_sec(output_path)
-                logger.info(
-                    "TTS готово: модель=%s, %.1fс, файл=%s",
-                    model,
-                    duration,
-                    output_path.name,
-                )
-                return duration
-            except GeminiTTSError as exc:
-                last_error = exc
-                if "недоступна" in str(exc).lower() or "404" in str(exc):
-                    logger.warning("TTS модель %s недоступна, пробуем следующую", model)
-                    continue
-                raise
+        for model in models:
+            for attempt in range(settings.GEMINI_TTS_MAX_RETRIES):
+                try:
+                    pcm, mime = await _call_tts_model(model, prompt)
+                    rate, channels = _parse_pcm_from_mime(mime)
+                    write_pcm_as_wav(pcm, output_path, rate=rate, channels=channels)
+                    duration = wav_duration_sec(output_path)
+                    logger.info(
+                        "TTS готово: модель=%s, %.1fс, файл=%s",
+                        model,
+                        duration,
+                        output_path.name,
+                    )
+                    return duration
+                except LLMRateLimitError as exc:
+                    last_error = exc
+                    wait_sec = settings.GEMINI_TTS_RETRY_BASE_SEC * (2 ** attempt)
+                    logger.warning(
+                        "TTS rate limit: модель=%s, попытка %s/%s, ждём %.0fс",
+                        model,
+                        attempt + 1,
+                        settings.GEMINI_TTS_MAX_RETRIES,
+                        wait_sec,
+                    )
+                    await asyncio.sleep(wait_sec)
+                except GeminiTTSError as exc:
+                    last_error = exc
+                    if "недоступна" in str(exc).lower() or "404" in str(exc):
+                        logger.warning("TTS модель %s недоступна, пробуем следующую", model)
+                        break
+                    raise
 
     raise GeminiTTSError(
-        f"Не удалось синтезировать озвучку. Последняя ошибка: {last_error}"
+        "Лимит Gemini TTS исчерпан после нескольких попыток. "
+        "Подождите 1–2 минуты и нажмите «Собрать Reels» снова. "
+        f"Последняя ошибка: {last_error}"
     )

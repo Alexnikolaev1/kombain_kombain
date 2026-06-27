@@ -14,6 +14,7 @@ from pathlib import Path
 
 from config import get_settings
 from services.gemini_tts import GeminiTTSError, synthesize_speech_to_wav
+from services.llm_errors import LLMRateLimitError
 from services.reels_timeline import ReelsScene, ReelsTimeline
 from services.stock_video import StockVideoError, fetch_pexels_clip
 
@@ -239,6 +240,13 @@ async def render_reels_video(
 
     try:
         for index, scene in enumerate(scenes, start=1):
+            if index > 1 and settings.GEMINI_TTS_SCENE_DELAY_SEC > 0:
+                await report(
+                    f"⏳ Пауза {settings.GEMINI_TTS_SCENE_DELAY_SEC:.0f}с перед сценой "
+                    f"{index}/{len(scenes)}..."
+                )
+                await asyncio.sleep(settings.GEMINI_TTS_SCENE_DELAY_SEC)
+
             await report(f"🎙 Озвучка и монтаж сцены {index}/{len(scenes)}...")
             clip = await _build_scene_clip(scene=scene, work_dir=work_dir, index=index)
             clip_paths.append(clip)
@@ -257,7 +265,7 @@ async def render_reels_video(
 
         logger.info("Reels собран: %s (%.1f МБ)", output_path.name, size_mb)
         return output_path
-    except GeminiTTSError as exc:
+    except (GeminiTTSError, LLMRateLimitError) as exc:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise ReelsRenderError(str(exc)) from exc
     except Exception:

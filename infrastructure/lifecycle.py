@@ -61,11 +61,16 @@ async def run_bot(
         )
 
     polling_task = asyncio.create_task(
-        dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), handle_signals=False),
+        dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            handle_signals=False,
+            drop_pending_updates=True,
+        ),
         name="telegram-polling",
     )
 
-    logger.info("🚀 Бот запущен")
+    logger.info("🚀 Бот запущен (должен быть только 1 экземпляр — иначе Telegram Conflict)")
 
     try:
         shutdown_wait = asyncio.create_task(shutdown_event.wait(), name="shutdown-wait")

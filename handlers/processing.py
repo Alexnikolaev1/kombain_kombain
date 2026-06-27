@@ -29,6 +29,7 @@ from handlers.keyboards import (
 from handlers.cancel_flow import cancel_workflow
 from handlers.states import ProcessingStates
 from handlers.task_registry import register_user_task, unregister_user_task
+from infrastructure.health import touch_heartbeat
 from prompts.templates import get_display_name, parse_action_slug
 from services.llm_client import DailyLimitExceededError, LLMError
 from services.reels_renderer import ReelsRenderError
@@ -501,13 +502,14 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
     status_msg = await callback.message.answer(
         "⏳ <b>Собираю Reels...</b>\n"
         "<i>Gemini TTS → B-roll → FFmpeg</i>\n\n"
-        "Это может занять 2–5 минут.",
+        "Это может занять 3–7 минут (озвучка с паузами из-за лимита Gemini TTS).",
         parse_mode="HTML",
     )
 
     work_dir: str | None = None
 
     async def on_progress(message: str) -> None:
+        touch_heartbeat()
         try:
             await status_msg.edit_text(
                 f"⏳ <b>Собираю Reels...</b>\n{escape_html(message)}",
@@ -517,27 +519,26 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
             pass
 
     try:
-        async with LoadingAnimator(status_msg):
-            if not data.get("last_timeline_json"):
-                await on_progress("📋 Строю таймлайн сцен...")
-                timeline, _ = await _load_or_build_timeline(
-                    user_id=user_id,
-                    data=data,
-                    content_session=content_session,
-                    context=context,
-                )
-                await state.update_data(last_timeline_json=timeline.to_dict())
-            else:
-                timeline = timeline_from_dict(data["last_timeline_json"])
-
-            video_path, elapsed_ms = await _reels_render.run(
+        if not data.get("last_timeline_json"):
+            await on_progress("📋 Строю таймлайн сцен...")
+            timeline, _ = await _load_or_build_timeline(
                 user_id=user_id,
-                timeline=timeline,
-                source_url=content_session.source_url,
-                source_type=source_type_enum,
-                on_progress=on_progress,
+                data=data,
+                content_session=content_session,
+                context=context,
             )
-            work_dir = str(video_path.parent)
+            await state.update_data(last_timeline_json=timeline.to_dict())
+        else:
+            timeline = timeline_from_dict(data["last_timeline_json"])
+
+        video_path, elapsed_ms = await _reels_render.run(
+            user_id=user_id,
+            timeline=timeline,
+            source_url=content_session.source_url,
+            source_type=source_type_enum,
+            on_progress=on_progress,
+        )
+        work_dir = str(video_path.parent)
 
         video_bytes = video_path.read_bytes()
         caption = (
@@ -561,7 +562,9 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
         )
     except asyncio.CancelledError:
         await status_msg.edit_text(
-            "↩️ <b>Отменено.</b>",
+            "↩️ <b>Прервано.</b>\n\n"
+            "Возможно, запущено два экземпляра бота (Railway + локально). "
+            "Оставьте только один и нажмите «Собрать Reels» снова.",
             parse_mode="HTML",
             reply_markup=_reels_actions_keyboard(has_timeline=bool(data.get("last_timeline_json"))),
         )

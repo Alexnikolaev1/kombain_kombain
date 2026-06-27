@@ -78,6 +78,9 @@ class Settings:
     GEMINI_TTS_LANGUAGE: str = field(
         default_factory=lambda: os.getenv("GEMINI_TTS_LANGUAGE", "ru-RU")
     )
+    GEMINI_TTS_MAX_RETRIES: int = int(os.getenv("GEMINI_TTS_MAX_RETRIES", "5"))
+    GEMINI_TTS_RETRY_BASE_SEC: float = float(os.getenv("GEMINI_TTS_RETRY_BASE_SEC", "8"))
+    GEMINI_TTS_SCENE_DELAY_SEC: float = float(os.getenv("GEMINI_TTS_SCENE_DELAY_SEC", "2.5"))
 
     # Pexels — бесплатный сток B-roll (опционально; без ключа — цветной фон)
     PEXELS_API_KEY: str = field(default_factory=lambda: os.getenv("PEXELS_API_KEY", ""))
@@ -86,7 +89,7 @@ class Settings:
     REELS_RENDER_ENABLED: bool = (
         os.getenv("REELS_RENDER_ENABLED", "true").lower() == "true"
     )
-    REELS_RENDER_MAX_SCENES: int = int(os.getenv("REELS_RENDER_MAX_SCENES", "8"))
+    REELS_RENDER_MAX_SCENES: int = int(os.getenv("REELS_RENDER_MAX_SCENES", "6"))
     REELS_VIDEO_MAX_MB: int = int(os.getenv("REELS_VIDEO_MAX_MB", "45"))
 
     # Модель по умолчанию
