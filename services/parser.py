@@ -185,6 +185,17 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
         )
 
         if not transcript_text:
+            settings = get_settings()
+            if settings.TRANSCRIPT_FALLBACK_ENABLED and settings.GEMINI_API_KEY:
+                transcript_text = await _try_gemini_transcript_fallback(
+                    video_id,
+                    max_chars,
+                    settings.TRANSCRIPT_MAX_DURATION_SEC,
+                )
+                if transcript_text:
+                    language = "gemini-audio"
+
+        if not transcript_text:
             # Фоллбэк на описание если нет субтитров
             content = description[:max_chars] if description else ""
             if not content:
@@ -883,6 +894,84 @@ def _fetch_youtube_data_sync(
             logger.info("transcript-api отключён, пропускаем fallback для %s", video_id)
 
     return title, description, transcript_text, language
+
+
+def _download_youtube_audio_sync(
+    video_id: str,
+    dest_dir: Path,
+    max_duration_sec: int,
+) -> Path | None:
+    """Скачивает аудиодорожку YouTube для распознавания речи."""
+    import yt_dlp
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    out_template = str(dest_dir / f"{video_id}.%(ext)s")
+
+    opts = _ytdlp_options(use_cookies=True)
+    opts["skip_download"] = False
+    opts["format"] = "bestaudio/best"
+    opts["outtmpl"] = out_template
+    opts["postprocessors"] = [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "64",
+        }
+    ]
+    opts["postprocessor_args"] = {"ffmpeg": ["-t", str(max_duration_sec)]}
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        logger.warning("Не удалось скачать аудио %s: %s", video_id, exc)
+        return None
+
+    for path in sorted(dest_dir.glob(f"{video_id}.*")):
+        if path.suffix.lower() in {".mp3", ".m4a", ".wav", ".ogg"}:
+            return path
+    return None
+
+
+async def _try_gemini_transcript_fallback(
+    video_id: str,
+    max_chars: int,
+    max_duration_sec: int,
+) -> str:
+    """Скачивает аудио и распознаёт через Gemini."""
+    import shutil
+    import tempfile
+
+    from services.transcription import TranscriptionError, transcribe_audio_file
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="yt_audio_"))
+    try:
+        loop = asyncio.get_event_loop()
+        audio_path = await loop.run_in_executor(
+            None,
+            _download_youtube_audio_sync,
+            video_id,
+            tmp_dir,
+            max_duration_sec,
+        )
+        if not audio_path:
+            return ""
+
+        raw = await transcribe_audio_file(audio_path)
+        cleaned = _clean_transcript(raw)[:max_chars]
+        if cleaned:
+            logger.info(
+                "Транскрипт через Gemini audio: %s (%d символов)",
+                video_id,
+                len(cleaned),
+            )
+        return cleaned
+    except TranscriptionError as exc:
+        logger.warning("Gemini transcript fallback для %s: %s", video_id, exc)
+        return ""
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _clean_transcript(text: str) -> str:

@@ -15,7 +15,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from config import get_settings
-from db.models import AICache, Base, ContentSource, PromptType, UsageStat, User
+from db.models import AICache, Base, ContentSource, Project, PromptType, UsageStat, User
 from domain.models_catalog import resolve_model_id
 
 logger = logging.getLogger("ai_kombain.db")
@@ -334,3 +334,93 @@ async def clear_user_cache(session: AsyncSession, user_id: int) -> int:
         delete(AICache).where(AICache.user_id == user_id)
     )
     return int(result.rowcount or 0)
+
+
+# ──────────────────────────────────────────────
+# Проекты пользователя
+# ──────────────────────────────────────────────
+
+async def save_user_project(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    title: str,
+    source_url: str | None = None,
+    source_type: ContentSource | None = None,
+    content_hash: str | None = None,
+    script_text: str | None = None,
+    timeline_json: str | None = None,
+) -> Project:
+    """Сохраняет или обновляет проект по content_hash."""
+    settings = get_settings()
+    existing = None
+    if content_hash:
+        result = await session.execute(
+            select(Project).where(
+                Project.user_id == user_id,
+                Project.content_hash == content_hash,
+            )
+        )
+        existing = result.scalar_one_or_none()
+
+    if existing:
+        existing.title = title[:256]
+        existing.source_url = source_url
+        existing.source_type = source_type
+        if script_text is not None:
+            existing.script_text = script_text
+        if timeline_json is not None:
+            existing.timeline_json = timeline_json
+        existing.updated_at = datetime.utcnow()
+        project = existing
+    else:
+        project = Project(
+            user_id=user_id,
+            title=title[:256],
+            source_url=source_url,
+            source_type=source_type,
+            content_hash=content_hash,
+            script_text=script_text,
+            timeline_json=timeline_json,
+        )
+        session.add(project)
+
+    await session.flush()
+
+    # Лимит проектов на пользователя
+    result = await session.execute(
+        select(Project.id)
+        .where(Project.user_id == user_id)
+        .order_by(Project.updated_at.desc())
+    )
+    ids = [row[0] for row in result.all()]
+    overflow = ids[settings.PROJECTS_MAX_PER_USER :]
+    if overflow:
+        await session.execute(delete(Project).where(Project.id.in_(overflow)))
+
+    return project
+
+
+async def list_user_projects(
+    session: AsyncSession,
+    user_id: int,
+    *,
+    limit: int = 10,
+) -> list[Project]:
+    result = await session.execute(
+        select(Project)
+        .where(Project.user_id == user_id)
+        .order_by(Project.updated_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_user_project(
+    session: AsyncSession,
+    user_id: int,
+    project_id: int,
+) -> Project | None:
+    return await session.scalar(
+        select(Project).where(Project.id == project_id, Project.user_id == user_id)
+    )

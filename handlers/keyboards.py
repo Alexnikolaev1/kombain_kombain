@@ -26,10 +26,13 @@ def get_main_menu() -> ReplyKeyboardMarkup:
         KeyboardButton(text="📝 Анализ текста"),
     )
     builder.row(
+        KeyboardButton(text="📁 Мои проекты"),
         KeyboardButton(text="📊 Мой кэш / Статистика"),
-        KeyboardButton(text="⚙️ Настройки"),
     )
-    builder.row(KeyboardButton(text="❓ Помощь"))
+    builder.row(
+        KeyboardButton(text="⚙️ Настройки"),
+        KeyboardButton(text="❓ Помощь"),
+    )
     return builder.as_markup(
         resize_keyboard=True,
         input_field_placeholder="Вставьте ссылку или введите текст...",
@@ -80,10 +83,15 @@ def reels_render_available() -> bool:
     return settings.REELS_RENDER_ENABLED and bool(settings.GEMINI_API_KEY)
 
 
+def content_pack_available() -> bool:
+    return get_settings().CONTENT_PACK_ENABLED
+
+
 def get_result_keyboard(
     *,
     show_timeline: bool = False,
     show_render: bool = False,
+    show_content_pack: bool = False,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     action_row: list[InlineKeyboardButton] = []
@@ -94,15 +102,40 @@ def get_result_keyboard(
                 callback_data="result:reels_timeline",
             ),
         )
+    if action_row:
+        builder.row(*action_row)
+
     if show_render and reels_render_available():
-        action_row.append(
+        builder.row(
             InlineKeyboardButton(
-                text="🎬 Собрать Reels",
+                text="🎬 Reels (классика)",
                 callback_data="result:reels_render",
             ),
         )
-    if action_row:
-        builder.row(*action_row)
+        builder.row(
+            InlineKeyboardButton(
+                text="💬 Reels + субтитры",
+                callback_data="result:reels_render_subs",
+            ),
+            InlineKeyboardButton(
+                text="🎵 Reels + музыка",
+                callback_data="result:reels_render_music",
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="✨ Reels Pro",
+                callback_data="result:reels_render_pro",
+            ),
+        )
+
+    if show_content_pack and content_pack_available():
+        builder.row(
+            InlineKeyboardButton(
+                text="📦 Собрать пакет",
+                callback_data="result:content_pack",
+            ),
+        )
     builder.row(
         InlineKeyboardButton(text="🔄 Другой формат", callback_data="result:reprocess"),
         InlineKeyboardButton(text="📋 Скопировать", callback_data="result:copy_hint"),

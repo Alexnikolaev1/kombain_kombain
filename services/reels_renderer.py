@@ -15,7 +15,9 @@ from pathlib import Path
 from config import get_settings
 from services.gemini_tts import GeminiTTSError, synthesize_speech_to_wav
 from services.llm_errors import LLMRateLimitError
+from services.reels_render_modes import ReelsRenderOptions
 from services.reels_timeline import ReelsScene, ReelsTimeline
+from services.stock_music import fetch_background_music
 from services.stock_video import StockVideoError, fetch_pexels_clip
 
 logger = logging.getLogger("ai_kombain.reels_renderer")
@@ -108,8 +110,62 @@ def _drawtext_y(lines_count: int) -> str:
     return "h*0.76"
 
 
-def _format_drawtext_multiline(lines: list[str]) -> str:
-    return "\\n".join(_escape_drawtext(line) for line in lines)
+def _wrap_subtitle_text(
+    text: str,
+    *,
+    max_chars_per_line: int = 28,
+    max_lines: int = 3,
+) -> list[str]:
+    return _wrap_on_screen_text(
+        text,
+        max_chars_per_line=max_chars_per_line,
+        max_lines=max_lines,
+    )
+
+
+def _subtitle_fontsize(lines: list[str]) -> int:
+    max_len = max((len(line) for line in lines), default=0)
+    if max_len > 30:
+        return 30
+    if max_len > 24:
+        return 34
+    if len(lines) >= 3:
+        return 32
+    return 38
+
+
+def _subtitle_y(lines_count: int) -> str:
+    if lines_count >= 3:
+        return "h*0.72"
+    if lines_count == 2:
+        return "h*0.78"
+    return "h*0.84"
+
+
+def _append_drawtext(
+    vf_parts: list[str],
+    *,
+    lines: list[str],
+    font_path: str,
+    y_expr: str,
+    fontsize: int,
+    line_spacing: int = 6,
+) -> None:
+    if not lines:
+        return
+    text = _format_drawtext_multiline(lines)
+    font = font_path.replace("\\", "/").replace(":", "\\:")
+    vf_parts.append(
+        "drawtext="
+        f"fontfile='{font}':"
+        f"text='{text}':"
+        f"fontsize={fontsize}:fontcolor=white:"
+        "x=(w-text_w)/2:"
+        f"y={y_expr}:"
+        f"line_spacing={line_spacing}:"
+        "borderw=3:bordercolor=black@0.85:"
+        "box=1:boxcolor=black@0.35:boxborderw=8"
+    )
 
 
 async def _probe_media_duration(path: Path) -> float:
@@ -171,6 +227,7 @@ async def _build_scene_clip(
     scene: ReelsScene,
     work_dir: Path,
     index: int,
+    options: ReelsRenderOptions,
 ) -> Path:
     scene_dir = work_dir / f"scene_{index:02d}"
     scene_dir.mkdir(parents=True, exist_ok=True)
@@ -199,22 +256,27 @@ async def _build_scene_clip(
     ]
 
     font_path = _resolve_font_path()
-    if scene.on_screen_text and font_path:
-        lines = _wrap_on_screen_text(scene.on_screen_text)
-        fontsize = _fontsize_for_display(lines)
-        text = _format_drawtext_multiline(lines)
-        font = font_path.replace("\\", "/").replace(":", "\\:")
-        vf_parts.append(
-            "drawtext="
-            f"fontfile='{font}':"
-            f"text='{text}':"
-            f"fontsize={fontsize}:fontcolor=white:"
-            "x=(w-text_w)/2:"
-            f"y={_drawtext_y(len(lines))}:"
-            "line_spacing=8:"
-            "borderw=2:bordercolor=black@0.75:"
-            "box=1:boxcolor=black@0.45:boxborderw=12"
-        )
+    if font_path:
+        if options.show_on_screen_text and scene.on_screen_text:
+            lines = _wrap_on_screen_text(scene.on_screen_text)
+            _append_drawtext(
+                vf_parts,
+                lines=lines,
+                font_path=font_path,
+                y_expr=_drawtext_y(len(lines)),
+                fontsize=_fontsize_for_display(lines),
+                line_spacing=8,
+            )
+        if options.show_subtitles and scene.voiceover:
+            sub_lines = _wrap_subtitle_text(scene.voiceover)
+            _append_drawtext(
+                vf_parts,
+                lines=sub_lines,
+                font_path=font_path,
+                y_expr=_subtitle_y(len(sub_lines)),
+                fontsize=_subtitle_fontsize(sub_lines),
+                line_spacing=6,
+            )
 
     filter_chain = ",".join(vf_parts)
 
@@ -307,9 +369,52 @@ def _safe_slug(title: str) -> str:
     return slug or "reels"
 
 
+async def _mix_background_music(
+    video_path: Path,
+    music_path: Path,
+    output_path: Path,
+    *,
+    video_duration: float,
+) -> None:
+    settings = get_settings()
+    volume = settings.REELS_MUSIC_VOLUME
+    filter_complex = (
+        f"[1:a]aloop=loop=-1:size=2e+09,atrim=0:{video_duration:.3f},"
+        f"volume={volume}[bg];"
+        f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+    )
+    await _run_ffmpeg(
+        [
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(music_path),
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "0:v",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            "-t",
+            f"{video_duration:.3f}",
+            str(output_path),
+        ]
+    )
+
+
 async def render_reels_video(
     timeline: ReelsTimeline,
     *,
+    options: ReelsRenderOptions | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> Path:
     """
@@ -317,6 +422,7 @@ async def render_reels_video(
     Возвращает путь к готовому файлу во временной директории.
     """
     settings = get_settings()
+    render_options = options or ReelsRenderOptions()
     if not settings.REELS_RENDER_ENABLED:
         raise ReelsRenderError("Автосборка Reels отключена (REELS_RENDER_ENABLED=false)")
     if not ffmpeg_available():
@@ -347,13 +453,39 @@ async def render_reels_video(
                 await asyncio.sleep(settings.GEMINI_TTS_SCENE_DELAY_SEC)
 
             await report(f"🎙 Озвучка и монтаж сцены {index}/{len(scenes)}...")
-            clip = await _build_scene_clip(scene=scene, work_dir=work_dir, index=index)
+            clip = await _build_scene_clip(
+                scene=scene,
+                work_dir=work_dir,
+                index=index,
+                options=render_options,
+            )
             clip_paths.append(clip)
 
         await report("🎬 Склеиваю финальный ролик...")
         slug = _safe_slug(timeline.title)
         output_path = work_dir / f"{slug}.mp4"
         await _concat_clips(clip_paths, output_path)
+
+        video_duration = await _probe_media_duration(output_path)
+
+        if render_options.add_music:
+            await report("🎵 Подмешиваю фоновую музыку...")
+            music_path = work_dir / "background_music.mp3"
+            has_music = await fetch_background_music(timeline.music_mood, music_path)
+            if has_music:
+                mixed_path = work_dir / f"{slug}_mixed.mp4"
+                await _mix_background_music(
+                    output_path,
+                    music_path,
+                    mixed_path,
+                    video_duration=video_duration,
+                )
+                output_path = mixed_path
+                video_duration = await _probe_media_duration(output_path)
+            else:
+                logger.warning(
+                    "Музыка не добавлена (задайте PIXABAY_API_KEY или проверьте mood)"
+                )
 
         size_mb = output_path.stat().st_size / (1024 * 1024)
         if size_mb > settings.REELS_VIDEO_MAX_MB:
@@ -364,7 +496,8 @@ async def render_reels_video(
 
         video_duration = await _probe_media_duration(output_path)
         logger.info(
-            "Reels собран: %s (%.1f МБ, %.1fс, %d сцен)",
+            "Reels собран [%s]: %s (%.1f МБ, %.1fс, %d сцен)",
+            render_options.mode.value,
             output_path.name,
             size_mb,
             video_duration,

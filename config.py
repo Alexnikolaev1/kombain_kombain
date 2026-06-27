@@ -91,6 +91,25 @@ class Settings:
     )
     REELS_RENDER_MAX_SCENES: int = int(os.getenv("REELS_RENDER_MAX_SCENES", "6"))
     REELS_VIDEO_MAX_MB: int = int(os.getenv("REELS_VIDEO_MAX_MB", "45"))
+    REELS_MUSIC_VOLUME: float = float(os.getenv("REELS_MUSIC_VOLUME", "0.18"))
+
+    # Pixabay — фоновая музыка для Reels (опционально)
+    PIXABAY_API_KEY: str = field(default_factory=lambda: os.getenv("PIXABAY_API_KEY", ""))
+
+    # Content Pack — пакетная генерация форматов
+    CONTENT_PACK_ENABLED: bool = (
+        os.getenv("CONTENT_PACK_ENABLED", "true").lower() == "true"
+    )
+
+    # Транскрипция аудио (Gemini) если субтитры YouTube недоступны
+    TRANSCRIPT_FALLBACK_ENABLED: bool = (
+        os.getenv("TRANSCRIPT_FALLBACK_ENABLED", "true").lower() == "true"
+    )
+    TRANSCRIPT_MAX_DURATION_SEC: int = int(os.getenv("TRANSCRIPT_MAX_DURATION_SEC", "1200"))
+    TRANSCRIPT_MIN_CHARS: int = int(os.getenv("TRANSCRIPT_MIN_CHARS", "200"))
+
+    # История проектов пользователя
+    PROJECTS_MAX_PER_USER: int = int(os.getenv("PROJECTS_MAX_PER_USER", "10"))
 
     # Модель по умолчанию
     DEFAULT_MODEL: str = field(

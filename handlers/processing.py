@@ -3,6 +3,8 @@ handlers/processing.py — Транспортный слой пайплайна 
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import shutil
@@ -16,10 +18,13 @@ from config import get_settings
 from application.use_cases import (
     SOURCE_TYPE_MAP,
     ContentIntakeUseCase,
+    ContentPackUseCase,
     GenerationUseCase,
     ReelsRenderUseCase,
 )
+from db.database import get_session, save_user_project
 from handlers.keyboards import (
+    content_pack_available,
     get_action_keyboard,
     get_cancel_keyboard,
     get_main_menu,
@@ -33,6 +38,11 @@ from handlers.task_registry import register_user_task, unregister_user_task
 from infrastructure.health import touch_heartbeat
 from prompts.templates import get_display_name, parse_action_slug
 from services.llm_client import DailyLimitExceededError, LLMError
+from services.reels_render_modes import (
+    MODE_LABELS,
+    ReelsRenderMode,
+    ReelsRenderOptions,
+)
 from services.reels_renderer import ReelsRenderError
 from services.reels_timeline import (
     TimelineParseError,
@@ -57,13 +67,59 @@ router = Router()
 _content_intake = ContentIntakeUseCase()
 _generation = GenerationUseCase()
 _reels_render = ReelsRenderUseCase()
+_content_pack = ContentPackUseCase()
+
+REELS_RENDER_MODES: dict[str, ReelsRenderMode] = {
+    "result:reels_render": ReelsRenderMode.CLASSIC,
+    "result:reels_render_subs": ReelsRenderMode.SUBTITLES,
+    "result:reels_render_music": ReelsRenderMode.MUSIC,
+    "result:reels_render_pro": ReelsRenderMode.PRO,
+}
+
+
+def _result_keyboard(*, last_prompt_type: str = "") -> object:
+    return get_result_keyboard(
+        show_timeline=(last_prompt_type == "reels_script"),
+        show_render=(last_prompt_type == "reels_script"),
+        show_content_pack=content_pack_available(),
+    )
 
 
 def _reels_actions_keyboard(*, has_timeline: bool = False) -> object:
     return get_result_keyboard(
         show_timeline=True,
         show_render=has_timeline or reels_render_available(),
+        show_content_pack=content_pack_available(),
     )
+
+
+async def _persist_project(
+    user_id: int,
+    content_session: ContentSession,
+    data: dict,
+) -> None:
+    content_hash = hashlib.sha256(
+        f"{content_session.source_url or ''}::{content_session.content[:800]}".encode()
+    ).hexdigest()
+    timeline_json = None
+    if data.get("last_timeline_json"):
+        timeline_json = json.dumps(data["last_timeline_json"], ensure_ascii=False)
+
+    script_text = None
+    if data.get("last_prompt_type") == "reels_script":
+        script_text = data.get("last_result")
+
+    async with get_session() as db:
+        await save_user_project(
+            db,
+            user_id=user_id,
+            title=content_session.title or "Проект",
+            source_url=content_session.source_url or None,
+            source_type=SOURCE_TYPE_MAP.get(content_session.source_type),
+            content_hash=content_hash,
+            script_text=script_text,
+            timeline_json=timeline_json,
+        )
 
 
 @router.message(F.text == "📹 Обработать видео")
@@ -233,6 +289,10 @@ async def _run_prompt(
     await state.update_data(last_result=outcome.response, last_prompt_type=action)
     await state.set_state(ProcessingStates.showing_result)
 
+    content_session = ContentSession.from_fsm_data(await state.get_data())
+    if action == "reels_script":
+        await _persist_project(user_id, content_session, await state.get_data())
+
     full_response = format_generation_message(
         get_display_name(prompt_type),
         outcome.response,
@@ -244,10 +304,7 @@ async def _run_prompt(
     await send_long_html(
         status_msg,
         full_response,
-        reply_markup=get_result_keyboard(
-            show_timeline=(action == "reels_script"),
-            show_render=(action == "reels_script"),
-        ),
+        reply_markup=_result_keyboard(last_prompt_type=action),
     )
 
 
@@ -290,7 +347,10 @@ async def handle_reprocess(callback: CallbackQuery, state: FSMContext) -> None:
     action = callback.data.split(":", 1)[1]
 
     if action == "back":
-        await callback.message.edit_reply_markup(reply_markup=get_result_keyboard())
+        data = await state.get_data()
+        await callback.message.edit_reply_markup(
+            reply_markup=_result_keyboard(last_prompt_type=data.get("last_prompt_type", "")),
+        )
         await callback.answer()
         return
 
@@ -442,6 +502,8 @@ async def result_reels_timeline(callback: CallbackQuery, state: FSMContext) -> N
     await state.update_data(last_timeline_json=timeline.to_dict())
     await state.set_state(ProcessingStates.showing_result)
 
+    await _persist_project(user_id, content_session, await state.get_data())
+
     cache_note = "💾 из кэша" if outcome.was_cached else f"🤖 {outcome.model.split('/')[-1]}"
     header = (
         f"📋 <b>Таймлайн готов</b> · {cache_note} · "
@@ -470,8 +532,18 @@ async def result_reels_timeline(callback: CallbackQuery, state: FSMContext) -> N
     )
 
 
-@router.callback_query(F.data == "result:reels_render")
+@router.callback_query(F.data.in_(set(REELS_RENDER_MODES.keys())))
 async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> None:
+    render_mode = REELS_RENDER_MODES[callback.data]
+    await _run_reels_render(callback, state, render_mode=render_mode)
+
+
+async def _run_reels_render(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    render_mode: ReelsRenderMode,
+) -> None:
     current_state = await state.get_state()
     if current_state == ProcessingStates.processing:
         await callback.answer("⏳ Уже обрабатывается, подождите...")
@@ -491,7 +563,8 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
         return
 
     await state.set_state(ProcessingStates.processing)
-    await callback.answer("🎬 Собираю видео...")
+    mode_label = MODE_LABELS.get(render_mode, "Reels")
+    await callback.answer(f"{mode_label}...")
 
     user_id = callback.from_user.id
     register_user_task(user_id, asyncio.current_task())
@@ -501,7 +574,7 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
     source_type_enum = SOURCE_TYPE_MAP.get(content_session.source_type)
 
     status_msg = await callback.message.answer(
-        "⏳ <b>Собираю Reels...</b>\n"
+        f"⏳ <b>{escape_html(mode_label)}</b>\n"
         "<i>Gemini TTS → B-roll → FFmpeg</i>\n\n"
         "Это может занять 3–7 минут (озвучка с паузами из-за лимита Gemini TTS).",
         parse_mode="HTML",
@@ -513,7 +586,7 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
         touch_heartbeat()
         try:
             await status_msg.edit_text(
-                f"⏳ <b>Собираю Reels...</b>\n{escape_html(message)}",
+                f"⏳ <b>{escape_html(mode_label)}</b>\n{escape_html(message)}",
                 parse_mode="HTML",
             )
         except Exception:
@@ -538,6 +611,7 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
             source_url=content_session.source_url,
             source_type=source_type_enum,
             on_progress=on_progress,
+            options=ReelsRenderOptions(mode=render_mode),
         )
         work_dir = str(video_path.parent)
 
@@ -548,12 +622,13 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
         )
         caption = (
             f"🎬 <b>{escape_html(timeline.title)}</b>\n"
+            f"🎞 {escape_html(mode_label)}\n"
             f"⏱ Сборка: {elapsed_ms / 1000:.0f}с · {rendered_scenes} сцен\n"
             f"<i>Черновик Reels — доработайте в CapCut при необходимости</i>"
         )
 
         await status_msg.edit_text(
-            f"✅ <b>Reels собран!</b> · {elapsed_ms / 1000:.0f}с\n"
+            f"✅ <b>{escape_html(mode_label)} готов!</b> · {elapsed_ms / 1000:.0f}с\n"
             f"{'─' * 30}",
             parse_mode="HTML",
             reply_markup=_reels_actions_keyboard(has_timeline=True),
@@ -606,4 +681,82 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
         unregister_user_task(user_id)
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
+        await state.set_state(ProcessingStates.showing_result)
+
+
+@router.callback_query(F.data == "result:content_pack")
+async def result_content_pack(callback: CallbackQuery, state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state == ProcessingStates.processing:
+        await callback.answer("⏳ Уже обрабатывается, подождите...")
+        return
+
+    if not content_pack_available():
+        await callback.answer("Content Pack отключён на сервере", show_alert=True)
+        return
+
+    data = await state.get_data()
+    content_session = ContentSession.from_fsm_data(data)
+    if not content_session.content:
+        await callback.answer("Сначала отправьте контент боту", show_alert=True)
+        return
+
+    await state.set_state(ProcessingStates.processing)
+    await callback.answer("📦 Собираю пакет...")
+
+    user_id = callback.from_user.id
+    register_user_task(user_id, asyncio.current_task())
+
+    status_msg = await callback.message.answer(
+        "⏳ <b>Content Pack</b>\n"
+        "<i>Заголовки · TL;DR · пост Telegram · хештеги</i>",
+        parse_mode="HTML",
+    )
+
+    async def on_progress(message: str) -> None:
+        touch_heartbeat()
+        try:
+            await status_msg.edit_text(
+                f"⏳ <b>Content Pack</b>\n{escape_html(message)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    try:
+        pack = await _content_pack.run(
+            user_id=user_id,
+            session=content_session,
+            on_progress=on_progress,
+        )
+        await status_msg.edit_text(
+            f"✅ <b>Content Pack готов!</b> · {pack.elapsed_ms / 1000:.0f}с\n"
+            f"{'─' * 30}",
+            parse_mode="HTML",
+            reply_markup=_result_keyboard(last_prompt_type=data.get("last_prompt_type", "")),
+        )
+        await send_long_html(
+            callback.message,
+            pack.format_html(),
+            reply_markup=_result_keyboard(last_prompt_type=data.get("last_prompt_type", "")),
+        )
+    except asyncio.CancelledError:
+        await status_msg.edit_text("↩️ <b>Отменено.</b>", parse_mode="HTML")
+    except DailyLimitExceededError as e:
+        await status_msg.edit_text(
+            f"🚫 <b>Лимит исчерпан</b>\n\n{escape_html(str(e))}",
+            parse_mode="HTML",
+        )
+    except ValueError as e:
+        await status_msg.edit_text(f"⚠️ {escape_html(str(e))}", parse_mode="HTML")
+    except LLMError as e:
+        await status_msg.edit_text(
+            f"❌ <b>Ошибка ИИ:</b> {escape_html(str(e))}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Content Pack ошибка: %s", e, exc_info=True)
+        await status_msg.edit_text("❌ Внутренняя ошибка при сборке пакета.")
+    finally:
+        unregister_user_task(user_id)
         await state.set_state(ProcessingStates.showing_result)

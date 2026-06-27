@@ -35,6 +35,9 @@ class PromptType(PyEnum):
     REELS_TIMELINE = "reels_timeline"  # Таймлайн монтажа из сценария Reels
     REELS_RENDER   = "reels_render"    # Автосборка MP4 Reels
     TLDR_SUMMARY   = "tldr_summary"    # Краткая суммаризация (TL;DR)
+    TELEGRAM_POST  = "telegram_post"   # Пост для Telegram
+    HASHTAGS_PACK  = "hashtags_pack"   # Хештеги для соцсетей
+    CONTENT_PACK   = "content_pack"    # Пакетная генерация (мета-тип для статистики)
 
 
 class ContentSource(PyEnum):
@@ -157,6 +160,22 @@ class UsageStat(Base):
     error_message  = Column(Text, nullable=True)
 
     created_at     = Column(DateTime, default=func.now(), nullable=False, index=True)
+
+
+class Project(Base):
+    """Сохранённый проект пользователя (сценарий, таймлайн, источник)."""
+    __tablename__ = "projects"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    user_id        = Column(BigInteger, nullable=False, index=True)
+    title          = Column(String(256), nullable=False, default="Проект")
+    source_url     = Column(Text, nullable=True)
+    source_type    = Column(Enum(ContentSource), nullable=True)
+    content_hash   = Column(String(64), nullable=True, index=True)
+    script_text    = Column(Text, nullable=True)
+    timeline_json  = Column(Text, nullable=True)
+    created_at     = Column(DateTime, default=func.now(), nullable=False)
+    updated_at     = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class FsmRecord(Base):

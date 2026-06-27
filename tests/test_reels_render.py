@@ -16,7 +16,9 @@ from services.reels_renderer import (
     _escape_drawtext,
     _fontsize_for_display,
     _safe_slug,
+    _subtitle_fontsize,
     _wrap_on_screen_text,
+    _wrap_subtitle_text,
 )
 from services.reels_timeline import timeline_from_dict
 
@@ -78,6 +80,13 @@ def test_fontsize_scales_with_length():
     )
 
 
+def test_subtitle_wrap_allows_longer_lines():
+    text = "Это длинная фраза озвучки для субтитров внизу экрана"
+    lines = _wrap_subtitle_text(text)
+    assert len(lines) <= 3
+    assert _subtitle_fontsize(lines) <= 38
+
+
 def test_safe_slug_cyrillic():
     slug = _safe_slug("Секрет успеха 2024!")
     assert slug
@@ -93,7 +102,7 @@ def test_timeline_from_dict():
 @pytest.mark.asyncio
 async def test_render_disabled_raises(monkeypatch):
     from config import get_settings
-    from services.reels_renderer import render_reels_video
+    from services.reels_renderer import ReelsRenderError, render_reels_video
 
     settings = get_settings()
     monkeypatch.setattr(settings, "REELS_RENDER_ENABLED", False)

@@ -165,6 +165,43 @@ USER_TEMPLATE_TLDR = """Создай структурированную выжи
 Цель читателя: понять суть за 60 секунд и знать, что с этим делать дальше.
 """
 
+SYSTEM_TELEGRAM_POST = """Ты — SMM-редактор Telegram-каналов.
+
+Напиши готовый пост для публикации в Telegram на основе контента.
+- Живой язык, умеренно эмодзи
+- Структура: цепляющий заход → 3–5 тезисов → CTA
+- Длина: 800–1200 символов
+- Без хештегов (они будут отдельно)
+"""
+
+USER_TEMPLATE_TELEGRAM_POST = """Напиши пост для Telegram на основе контента.
+
+Контент:
+{content}
+
+Тема/источник: {context}
+"""
+
+SYSTEM_HASHTAGS = """Ты — эксперт по продвижению в Instagram Reels, YouTube Shorts и TikTok.
+
+Подбери релевантные хештеги на русском и английском.
+Формат ответа:
+## 🇷🇺 Русские (7–10)
+#пример1 #пример2 ...
+## 🌍 Английские (5–7)
+#example1 #example2 ...
+## 💡 Совет
+Одна строка — как использовать хештеги для этого контента.
+"""
+
+USER_TEMPLATE_HASHTAGS = """Подбери хештеги для контента.
+
+Контент:
+{content}
+
+Тема: {context}
+"""
+
 
 # ──────────────────────────────────────────────
 # Реестр промтов
@@ -221,7 +258,35 @@ PROMPT_REGISTRY: dict[PromptType, dict[str, str]] = {
         "description": "Суть лонгрида за 60 секунд + чеклист",
         "emoji": "📋",
     },
+    PromptType.TELEGRAM_POST: {
+        "system": SYSTEM_TELEGRAM_POST,
+        "user_template": USER_TEMPLATE_TELEGRAM_POST,
+        "action_slug": "telegram_post",
+        "display_name": "✈️ Пост для Telegram",
+        "button_label": "✈️ Пост Telegram",
+        "reprocess_label": "✈️ Telegram",
+        "description": "Готовый пост для канала",
+        "emoji": "✈️",
+    },
+    PromptType.HASHTAGS_PACK: {
+        "system": SYSTEM_HASHTAGS,
+        "user_template": USER_TEMPLATE_HASHTAGS,
+        "action_slug": "hashtags_pack",
+        "display_name": "#️⃣ Хештеги",
+        "button_label": "#️⃣ Хештеги",
+        "reprocess_label": "#️⃣ Хештеги",
+        "description": "Хештеги для Reels/Shorts/TikTok",
+        "emoji": "#️⃣",
+    },
 }
+
+# Типы, входящие в Content Pack (параллельная генерация)
+CONTENT_PACK_TYPES: list[PromptType] = [
+    PromptType.VIRAL_TITLES,
+    PromptType.TLDR_SUMMARY,
+    PromptType.TELEGRAM_POST,
+    PromptType.HASHTAGS_PACK,
+]
 
 # Порядок кнопок в UI
 PROMPT_MENU_ORDER: list[PromptType] = [
