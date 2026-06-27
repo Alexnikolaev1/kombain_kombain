@@ -98,7 +98,7 @@ def test_normalize_b64_strips_whitespace():
 
 def test_primary_player_clients_with_cookies(tmp_path, monkeypatch):
     from config import get_settings
-    from services.parser import _primary_ytdlp_player_clients
+    from services.parser import _build_ytdlp_client_chain, _primary_ytdlp_player_clients
 
     cookie_file = tmp_path / "cookies.txt"
     cookie_file.write_text(
@@ -111,6 +111,16 @@ def test_primary_player_clients_with_cookies(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "YOUTUBE_COOKIES_B64", "")
 
     assert _primary_ytdlp_player_clients() == ["web", "mweb"]
+    chain = _build_ytdlp_client_chain(has_cookies=True)
+    assert chain[0] == ["web", "mweb"]
+    assert ["android", "web"] in chain
+
+
+def test_ytdlp_format_error_detection():
+    from services.parser import _is_ytdlp_format_error
+
+    assert _is_ytdlp_format_error(Exception("Requested format is not available"))
+    assert not _is_ytdlp_format_error(Exception("Sign in to confirm"))
 
 
 def test_inspect_youtube_cookiefile(tmp_path):

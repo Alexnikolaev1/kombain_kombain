@@ -194,8 +194,8 @@ async def parse_youtube(url: str, max_chars: int = 50_000) -> ParsedContent:
                     url=url,
                     title=title,
                     error=(
-                        "Субтитры недоступны с сервера. YouTube блокирует облачные IP. "
-                        "Добавьте YOUTUBE_COOKIES_B64 в Railway, реальный YOUTUBE_PROXY "
+                        "Субтитры недоступны с сервера. "
+                        "Обновите YOUTUBE_COOKIES_B64 в Railway (cookies устарели) "
                         "или перешлите текст видео боту."
                     ),
                 )
@@ -409,36 +409,92 @@ def _get_youtube_cookiefile() -> str:
 
 
 def _primary_ytdlp_player_clients() -> list[str]:
-    """С cookies лучше web-клиент; android часто игнорирует авторизацию."""
+    """С cookies — web; без — android (меньше bot-check на облаке)."""
     if _get_youtube_cookiefile():
         return ["web", "mweb"]
     return ["android", "web"]
 
 
-def _ytdlp_options(player_clients: list[str] | None = None) -> dict:
-    """Опции yt-dlp: без скачивания видео, с обходом типичных ошибок форматов."""
+def _build_ytdlp_client_chain(*, has_cookies: bool) -> list[list[str]]:
+    """Цепочка player_client: с cookies сначала web, затем android-fallback."""
+    candidates: list[list[str] | None] = [
+        _primary_ytdlp_player_clients(),
+        ["android", "web"],
+        ["ios", "web"],
+        ["mweb"],
+        ["web"] if not has_cookies else None,
+    ]
+    chain: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for item in candidates:
+        if not item:
+            continue
+        key = tuple(item)
+        if key not in seen:
+            seen.add(key)
+            chain.append(item)
+    return chain
+
+
+class _YtdlpCaptureLogger:
+    """Собирает предупреждения yt-dlp (cookies rotated и т.д.)."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        self.messages.append(str(msg))
+
+    def error(self, msg: str) -> None:
+        self.messages.append(str(msg))
+
+
+def _cookies_marked_invalid(logger: _YtdlpCaptureLogger) -> bool:
+    joined = " ".join(logger.messages).lower()
+    return "cookies are no longer valid" in joined or "have likely been rotated" in joined
+
+
+def _ytdlp_options(
+    player_clients: list[str] | None = None,
+    *,
+    use_cookies: bool = True,
+    capture_logger: _YtdlpCaptureLogger | None = None,
+) -> dict:
+    """Опции yt-dlp: метаданные и субтитры без скачивания видео."""
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        # Нужны только субтитры — web-клиент часто падает без форматов видео.
+        "ignore_no_formats_error": True,
         "extractor_args": {
             "youtube": {
                 "player_client": player_clients or ["android", "web"],
             },
         },
     }
+    if capture_logger is not None:
+        opts["logger"] = capture_logger
+
     proxy = get_effective_youtube_proxy()
     if proxy:
         opts["proxy"] = proxy
-    cookiefile = _get_youtube_cookiefile()
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
-        logger.debug("yt-dlp cookiefile: %s", cookiefile)
+    if use_cookies:
+        cookiefile = _get_youtube_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+            logger.debug("yt-dlp cookiefile: %s", cookiefile)
     return opts
 
 
-# Как в первом рабочем деплое — один проход (web при cookies, android без).
+# Дополнительные client'ы — только без cookies (иначе усугубляем блокировку IP).
 _YTDLP_PLAYER_CLIENTS_FALLBACK: list[list[str]] = [["ios", "web"], ["mweb"]]
 
 
@@ -593,57 +649,129 @@ def _extract_ytdlp_transcript(
     return "", ""
 
 
+def _is_ytdlp_format_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "requested format is not available" in text or "no video formats" in text
+
+
+def _try_ytdlp_extract(
+    video_id: str,
+    preferred_languages: list[str],
+    max_chars: int,
+    *,
+    player_clients: list[str],
+    use_cookies: bool,
+) -> tuple[str, str, str, str, _YtdlpCaptureLogger]:
+    """Один проход yt-dlp. Возвращает title, description, transcript, lang, logger."""
+    import yt_dlp
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    capture = _YtdlpCaptureLogger()
+
+    with yt_dlp.YoutubeDL(
+        _ytdlp_options(player_clients, use_cookies=use_cookies, capture_logger=capture)
+    ) as ydl:
+        info = ydl.extract_info(url, download=False)
+        title = str(info.get("title") or "")
+        description = str(info.get("description") or "")[:1000]
+        transcript_text, language = _extract_ytdlp_transcript(
+            info,
+            preferred_languages,
+            ydl,
+        )
+        if transcript_text:
+            transcript_text = _clean_transcript(transcript_text)[:max_chars]
+        return title, description, transcript_text, language, capture
+
+
 def _fetch_via_ytdlp(
     video_id: str,
     preferred_languages: list[str],
     max_chars: int,
 ) -> tuple[str, str, str, str]:
-    import yt_dlp
-
-    url = f"https://www.youtube.com/watch?v={video_id}"
     title = ""
     description = ""
     last_error: Exception | None = None
     bot_blocked = False
+    cookies_invalid = False
 
     has_cookies = bool(_get_youtube_cookiefile())
-    client_chain = [_primary_ytdlp_player_clients()]
-    if not has_cookies:
-        client_chain.extend(_YTDLP_PLAYER_CLIENTS_FALLBACK)
+    cookie_passes = (True, False) if has_cookies else (False,)
 
-    for player_clients in client_chain:
-        try:
-            with yt_dlp.YoutubeDL(_ytdlp_options(player_clients)) as ydl:
-                info = ydl.extract_info(url, download=False)
-                title = str(info.get("title") or "")
-                description = str(info.get("description") or "")[:1000]
-                transcript_text, language = _extract_ytdlp_transcript(
-                    info,
-                    preferred_languages,
-                    ydl,
-                )
-                if transcript_text:
-                    transcript_text = _clean_transcript(transcript_text)[:max_chars]
-                    return title, description, transcript_text, language
-        except Exception as e:
-            last_error = e
-            if _is_youtube_bot_error(e):
-                bot_blocked = True
-                logger.warning(
-                    "YouTube bot-check для %s — прекращаем попытки (client=%s)",
-                    video_id,
-                    player_clients,
-                )
-                break
-            logger.warning(
-                "yt-dlp player_client=%s ошибка для %s: %s",
-                player_clients,
+    for use_cookies in cookie_passes:
+        if use_cookies:
+            client_chain = _build_ytdlp_client_chain(has_cookies=True)
+        else:
+            logger.info(
+                "Повтор yt-dlp для %s без cookies — cookies устарели или не дали субтитры",
                 video_id,
-                e,
             )
+            client_chain = [["android", "web"], ["android"], *_YTDLP_PLAYER_CLIENTS_FALLBACK]
+
+        for player_clients in client_chain:
+            try:
+                (
+                    title,
+                    description,
+                    transcript_text,
+                    language,
+                    capture,
+                ) = _try_ytdlp_extract(
+                    video_id,
+                    preferred_languages,
+                    max_chars,
+                    player_clients=player_clients,
+                    use_cookies=use_cookies,
+                )
+                if _cookies_marked_invalid(capture):
+                    cookies_invalid = True
+                    if use_cookies and not transcript_text:
+                        logger.warning(
+                            "YouTube cookies устарели для %s — пробуем без cookies",
+                            video_id,
+                        )
+                        break
+                if transcript_text:
+                    logger.info(
+                        "yt-dlp OK: %s client=%s cookies=%s lang=%s",
+                        video_id,
+                        player_clients,
+                        use_cookies,
+                        language,
+                    )
+                    return title, description, transcript_text, language
+            except Exception as e:
+                last_error = e
+                if _is_youtube_bot_error(e):
+                    bot_blocked = True
+                    logger.warning(
+                        "YouTube bot-check для %s (client=%s, cookies=%s)",
+                        video_id,
+                        player_clients,
+                        use_cookies,
+                    )
+                    if not use_cookies:
+                        break
+                    break
+                if _is_ytdlp_format_error(e):
+                    logger.warning(
+                        "yt-dlp format error для %s (client=%s) — следующий client",
+                        video_id,
+                        player_clients,
+                    )
+                    continue
+                logger.warning(
+                    "yt-dlp player_client=%s ошибка для %s: %s",
+                    player_clients,
+                    video_id,
+                    e,
+                )
+
+        if bot_blocked and not use_cookies:
+            break
 
     if bot_blocked:
-        if has_cookies:
+        if has_cookies or cookies_invalid:
             raise YouTubeBotCheckError(
                 "YouTube cookies устарели или не подходят для IP сервера. "
                 "Экспортируйте свежие cookies из браузера (нужен аккаунт YouTube) "
@@ -654,7 +782,14 @@ def _fetch_via_ytdlp(
             "Добавьте YOUTUBE_COOKIES_B64 в Railway Variables "
             "или перешлите текст видео боту."
         )
-    if last_error:
+
+    if cookies_invalid and not title:
+        raise YouTubeBotCheckError(
+            "YouTube cookies устарели. Экспортируйте новые cookies из браузера "
+            "(залогинен в YouTube) и обновите YOUTUBE_COOKIES_B64 в Railway."
+        )
+
+    if last_error and not title:
         raise last_error
     return title, description, "", ""
 
@@ -767,6 +902,11 @@ def _humanize_youtube_error(error: str) -> str:
     error_lower = error.lower()
     if "private" in error_lower:
         return "Это приватное видео — субтитры недоступны"
+    if "requested format is not available" in error_lower:
+        return (
+            "YouTube временно не отдаёт метаданные с сервера. "
+            "Обновите cookies (YOUTUBE_COOKIES_B64) или попробуйте позже."
+        )
     if "not available" in error_lower or "unavailable" in error_lower:
         return "Видео недоступно в вашем регионе или удалено"
     if "age" in error_lower:
