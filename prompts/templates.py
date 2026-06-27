@@ -66,6 +66,7 @@ SYSTEM_REELS_TIMELINE = """Ты — режиссёр монтажа коротк
 - section: одно из hook | plot | climax | cta
 - broll_query: короткий поисковый запрос на английском (2-4 слова) для сток-видео
 - edit_hint: конкретная подсказка монтажёру (zoom, jump cut, slow-mo и т.д.)
+- on_screen_text: максимум 2 короткие строки по 18–20 символов (крупный текст на 9:16), иначе null
 - music_mood: настроение фоновой музыки одной фразой
 
 Ответ — ТОЛЬКО валидный JSON без markdown, без пояснений до или после.
@@ -84,7 +85,7 @@ SYSTEM_REELS_TIMELINE = """Ты — режиссёр монтажа коротк
       "end_sec": 3,
       "section": "hook",
       "voiceover": "текст озвучки",
-      "on_screen_text": "крупный текст на экране или null",
+      "on_screen_text": "короткий текст ≤20 симв. или null",
       "broll_query": "shocked face reaction",
       "broll_note": "крупный план лица в шоке",
       "edit_hint": "быстрый зум на первое слово"

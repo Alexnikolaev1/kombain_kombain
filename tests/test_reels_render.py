@@ -11,7 +11,13 @@ from services.gemini_tts import (
     write_pcm_as_wav,
     wav_duration_sec,
 )
-from services.reels_renderer import ReelsRenderError, _escape_drawtext, _safe_slug
+from services.reels_renderer import (
+    ReelsRenderError,
+    _escape_drawtext,
+    _fontsize_for_display,
+    _safe_slug,
+    _wrap_on_screen_text,
+)
 from services.reels_timeline import timeline_from_dict
 
 SAMPLE_TIMELINE = {
@@ -52,6 +58,24 @@ def test_wav_duration_roundtrip(tmp_path: Path):
 def test_escape_drawtext_special_chars():
     assert "\\:" in _escape_drawtext("A: B")
     assert "\\'" in _escape_drawtext("it's")
+
+
+def test_wrap_on_screen_text_short():
+    assert _wrap_on_screen_text("ВАУ") == ["ВАУ"]
+
+
+def test_wrap_on_screen_text_long_splits():
+    text = "Arena AI: Топ-модели без денег"
+    lines = _wrap_on_screen_text(text, max_chars_per_line=20, max_lines=2)
+    assert len(lines) <= 2
+    assert all(len(line) <= 20 for line in lines)
+    assert "Arena" in lines[0]
+
+
+def test_fontsize_scales_with_length():
+    assert _fontsize_for_display(["Коротко"]) > _fontsize_for_display(
+        ["Очень длинная строка текста"]
+    )
 
 
 def test_safe_slug_cyrillic():

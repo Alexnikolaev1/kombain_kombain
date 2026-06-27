@@ -56,6 +56,84 @@ def _escape_drawtext(text: str) -> str:
     return escaped
 
 
+def _wrap_on_screen_text(
+    text: str,
+    *,
+    max_chars_per_line: int = 20,
+    max_lines: int = 2,
+) -> list[str]:
+    """Разбивает длинный текст на 1–2 строки под ширину 9:16."""
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    if len(cleaned) <= max_chars_per_line:
+        return [cleaned]
+
+    words = cleaned.split()
+    lines: list[str] = []
+    current = ""
+
+    for word in words:
+        candidate = f"{current} {word}".strip() if current else word
+        if len(candidate) <= max_chars_per_line:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            if len(lines) >= max_lines:
+                return lines
+        current = word[:max_chars_per_line]
+
+    if current and len(lines) < max_lines:
+        lines.append(current[:max_chars_per_line])
+    return lines or [cleaned[:max_chars_per_line]]
+
+
+def _fontsize_for_display(lines: list[str]) -> int:
+    max_len = max((len(line) for line in lines), default=0)
+    if max_len > 24:
+        return 34
+    if max_len > 18:
+        return 42
+    if len(lines) >= 2:
+        return 44
+    return 52
+
+
+def _drawtext_y(lines_count: int) -> str:
+    if lines_count >= 3:
+        return "h*0.64"
+    if lines_count == 2:
+        return "h*0.70"
+    return "h*0.76"
+
+
+def _format_drawtext_multiline(lines: list[str]) -> str:
+    return "\\n".join(_escape_drawtext(line) for line in lines)
+
+
+async def _probe_media_duration(path: Path) -> float:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return 0.0
+    try:
+        return float(stdout.decode().strip())
+    except ValueError:
+        return 0.0
+
+
 async def _run_ffmpeg(args: list[str]) -> None:
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg",
@@ -118,30 +196,33 @@ async def _build_scene_clip(
         f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase",
         f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT}",
         "setsar=1",
-        f"trim=duration={duration:.3f}",
-        "setpts=PTS-STARTPTS",
     ]
 
     font_path = _resolve_font_path()
     if scene.on_screen_text and font_path:
-        text = _escape_drawtext(scene.on_screen_text[:80])
+        lines = _wrap_on_screen_text(scene.on_screen_text)
+        fontsize = _fontsize_for_display(lines)
+        text = _format_drawtext_multiline(lines)
         font = font_path.replace("\\", "/").replace(":", "\\:")
         vf_parts.append(
             "drawtext="
             f"fontfile='{font}':"
             f"text='{text}':"
-            "fontsize=64:fontcolor=white:"
-            "x=(w-text_w)/2:y=h*0.78:"
-            "box=1:boxcolor=black@0.45:boxborderw=16"
+            f"fontsize={fontsize}:fontcolor=white:"
+            "x=(w-text_w)/2:"
+            f"y={_drawtext_y(len(lines))}:"
+            "line_spacing=8:"
+            "borderw=2:bordercolor=black@0.75:"
+            "box=1:boxcolor=black@0.45:boxborderw=12"
         )
 
     filter_chain = ",".join(vf_parts)
 
-    await _run_ffmpeg(
+    ffmpeg_args: list[str] = ["-y"]
+    if has_stock:
+        ffmpeg_args.extend(["-stream_loop", "-1"])
+    ffmpeg_args.extend(
         [
-            "-y",
-            "-stream_loop",
-            "-1",
             "-i",
             str(stock_path),
             "-i",
@@ -162,29 +243,47 @@ async def _build_scene_clip(
             "aac",
             "-b:a",
             "128k",
-            "-shortest",
             "-t",
             f"{duration:.3f}",
             str(output_path),
         ]
     )
+    await _run_ffmpeg(ffmpeg_args)
+
+    actual = await _probe_media_duration(output_path)
+    if abs(actual - duration) > 0.75:
+        logger.warning(
+            "Сцена %s: ожидали %.1fс, ffprobe=%.1fс",
+            index,
+            duration,
+            actual,
+        )
     return output_path
 
 
 async def _concat_clips(clip_paths: list[Path], output_path: Path) -> None:
-    list_file = output_path.parent / "concat_list.txt"
-    lines = [f"file '{path.resolve().as_posix()}'" for path in clip_paths]
-    list_file.write_text("\n".join(lines), encoding="utf-8")
+    if len(clip_paths) == 1:
+        shutil.copy2(clip_paths[0], output_path)
+        return
+
+    inputs: list[str] = []
+    for clip_path in clip_paths:
+        inputs.extend(["-i", str(clip_path)])
+
+    n = len(clip_paths)
+    concat_inputs = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+    filter_complex = f"{concat_inputs}concat=n={n}:v=1:a=1[vout][aout]"
 
     await _run_ffmpeg(
         [
             "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
+            *inputs,
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
             "-c:v",
             "libx264",
             "-preset",
@@ -263,7 +362,14 @@ async def render_reels_video(
                 f"Лимит Telegram: {settings.REELS_VIDEO_MAX_MB} МБ."
             )
 
-        logger.info("Reels собран: %s (%.1f МБ)", output_path.name, size_mb)
+        video_duration = await _probe_media_duration(output_path)
+        logger.info(
+            "Reels собран: %s (%.1f МБ, %.1fс, %d сцен)",
+            output_path.name,
+            size_mb,
+            video_duration,
+            len(scenes),
+        )
         return output_path
     except (GeminiTTSError, LLMRateLimitError) as exc:
         shutil.rmtree(work_dir, ignore_errors=True)

@@ -12,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from application.dto import ContentSession, GenerationOutcome
+from config import get_settings
 from application.use_cases import (
     SOURCE_TYPE_MAP,
     ContentIntakeUseCase,
@@ -541,9 +542,13 @@ async def result_reels_render(callback: CallbackQuery, state: FSMContext) -> Non
         work_dir = str(video_path.parent)
 
         video_bytes = video_path.read_bytes()
+        rendered_scenes = min(
+            len(timeline.scenes),
+            get_settings().REELS_RENDER_MAX_SCENES,
+        )
         caption = (
             f"🎬 <b>{escape_html(timeline.title)}</b>\n"
-            f"⏱ Сборка: {elapsed_ms / 1000:.0f}с · {len(timeline.scenes)} сцен\n"
+            f"⏱ Сборка: {elapsed_ms / 1000:.0f}с · {rendered_scenes} сцен\n"
             f"<i>Черновик Reels — доработайте в CapCut при необходимости</i>"
         )
 
